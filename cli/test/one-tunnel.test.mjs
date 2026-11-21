@@ -622,15 +622,29 @@ test("setup through Local Studio mints the passcode and the connect code the way
 	}
 });
 
-test("with Local Studio's record already there, setup --cloudflare joins it without running local-studio", { skip: unixOnly }, async () => {
+test("with Local Studio's record already there, a route flag for another route refuses, and plain setup joins the record's route", { skip: unixOnly }, async () => {
 	const s = scenario("defer-record");
 	const local = await localServe(`https://${STUDIO}/mcp`);
 	try {
 		localStudioStub(s);
+		s.writeRecord({ v: 1, owner: "local-studio", route: "cloudflare", hostname: STUDIO, ports: { mcp: local.port } });
+		for (const flag of [["--tailnet"], ["--tailscale"]]) {
+			const r = await s.runAsync(["remote", "setup", ...flag, "--no-service", "--json"], {}, { hooks: true });
+			assert.equal(r.code, 1, r.out);
+			const report = r.json();
+			assert.equal(report.code, "route_mismatch", r.out);
+			assert.match(report.message, /cloudflare route for studio\.example\.com/);
+			assert.match(report.message, /local-studio tunnel off/);
+			assert.match(report.message, new RegExp(`without ${flag[0]}`));
+			assert.equal(s.remoteJson(), undefined, "nothing joined");
+			assert.deepEqual(s.proved(), []);
+		}
 		s.writeRecord({ v: 1, owner: "local-studio", route: "hosted", hostname: STUDIO, ports: { mcp: local.port } });
-		const r = await s.runAsync(["remote", "setup", "--cloudflare", "other.example.com", "--no-service"], {}, { hooks: true });
-		assert.equal(r.code, 0, r.out);
-		assert.match(r.out, /Local Studio already runs a hosted route for studio\.example\.com/);
+		const other = (await s.runAsync(["remote", "setup", "--cloudflare", "other.example.com", "--no-service", "--json"], {}, { hooks: true })).json();
+		assert.equal(other.code, "route_mismatch");
+		const plain = await s.runAsync(["remote", "setup", "--no-service"], {}, { hooks: true });
+		assert.equal(plain.code, 0, plain.out);
+		assert.equal(s.remoteJson().publicUrl, `https://${STUDIO}`);
 		assert.deepEqual(s.calls().filter((x) => x.startsWith("local-studio") || x.startsWith("cloudflared")), []);
 	} finally {
 		await local.close();

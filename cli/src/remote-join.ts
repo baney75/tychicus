@@ -309,7 +309,13 @@ export async function setupThroughLocalStudio(options: SetupOptions): Promise<nu
 	}
 	if (record) {
 		const asked = options.cloudflare !== undefined ? "cloudflare" : options.tailnet ? "tailnet" : options.tailscale ? "funnel" : undefined;
-		if (asked && asked !== record.route) say(`${sym.dot} Local Studio already runs a ${record.route} route for ${record.hostname}; a machine has one tunnel, so ${COMMAND_NAME} joins that one.`);
+		if (asked && asked !== record.route) {
+			const flag = asked === "cloudflare" ? "--cloudflare" : asked === "tailnet" ? "--tailnet" : "--tailscale";
+			return fail(
+				`Local Studio already runs a ${record.route} route for ${record.hostname}, and a machine has one tunnel, so ${COMMAND_NAME} can't set up a ${asked} route here. Run local-studio tunnel off first to change the route, or run ${COMMAND_NAME} remote setup without ${flag} to join the ${record.route} route. Nothing was changed.`,
+				"route_mismatch",
+			);
+		}
 	} else if (args && bin) {
 		say(`${sym.dot} Local Studio runs this machine's tunnel. Running: local-studio ${args.join(" ")}`);
 		const r = await runLocalStudio(bin, args, json);

@@ -218,7 +218,8 @@ Tychicus only reads it and never creates Local Studio's folder. The route carrie
   `cloudflared.yml` so Local Studio can adopt the tunnel. It saves `remote.json` with route `custom`, the address
   `https://<hostname>` and the record's `aliases`, moves serve to `ports.mcp`, and proves the address and each alias.
   If any proof fails, it puts `remote.json`, serve and its own route back as they were and exits non-zero.
-- `tychicus remote setup` with a route record joins it. Without a record, `--cloudflare <name>` or `--tailnet` runs
+- `tychicus remote setup` with a route record joins it. A route flag for another route than the record's refuses with
+  code `route_mismatch`: run `local-studio tunnel off` first, or run setup without the flag to join. Without a record, `--cloudflare <name>` or `--tailnet` runs
   `local-studio tunnel setup` with that route and `--json` when `local-studio` is on PATH, then joins. A Local Studio
   folder alone proves nothing (`install --local-studio` makes one). Funnel, no route, `--public-url`, and a re-run on
   this install's own Funnel or Cloudflare route stay Tychicus's own setup; `remote join` moves that route.
