@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { configDir } from "./files.ts";
-import { validHostname } from "./route-record.ts";
+import { readRouteRecord, validHostname } from "./route-record.ts";
 import { COMMAND_NAME } from "./self.ts";
 import { writeAtomic } from "./service.ts";
 
@@ -61,6 +61,17 @@ export function loadRemoteConfig(file: string = remoteFile()): RemoteConfig | un
 		...(allowHosts ? { allowHosts } : {}),
 		...(aliases?.length ? { aliases } : {}),
 	};
+}
+
+/** Reached only from the tailnet: Tychicus's own tailnet route, or Local Studio's tailnet route joined (its record's address and port). */
+export function reachedOnTailnet(config: RemoteConfig): boolean {
+	if (config.route !== "custom") return config.route === "tailnet";
+	try {
+		const record = readRouteRecord();
+		return record?.owner === "local-studio" && record.route === "tailnet" && config.publicUrl === `https://${record.hostname}` && config.port === record.ports.mcp;
+	} catch {
+		return false;
+	}
 }
 
 export function saveRemoteConfig(config: RemoteConfig): void {

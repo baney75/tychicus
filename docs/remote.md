@@ -218,12 +218,17 @@ Tychicus only reads it and never creates Local Studio's folder. The route carrie
   `cloudflared.yml` so Local Studio can adopt the tunnel. It saves `remote.json` with route `custom`, the address
   `https://<hostname>` and the record's `aliases`, moves serve to `ports.mcp`, and proves the address and each alias.
   If any proof fails, it puts `remote.json`, serve and its own route back as they were and exits non-zero.
-- `tychicus remote setup` with Local Studio present (`local-studio` on PATH, or its data folder exists) defers. With a
-  record it joins. Without one it runs `local-studio tunnel setup --cloudflare <name> --json` or `--tailnet --json`, then
-  joins. Funnel and no route at all are refused, since Local Studio doesn't run them. `--public-url` skips the deferral.
-- Tunnel setup in Local Studio is on its dev channel only. When `local-studio tunnel setup` answers `state: "waitlist"`,
-  Tychicus passes that answer through unchanged (`state` and `step` `waitlist`, Local Studio's `message`, and the whole
-  answer in `localStudio`), exits 3, and starts no tunnel of its own.
+- `tychicus remote setup` with a route record joins it. Without a record, `--cloudflare <name>` or `--tailnet` runs
+  `local-studio tunnel setup` with that route and `--json` when `local-studio` is on PATH, then joins. A Local Studio
+  folder alone proves nothing (`install --local-studio` makes one). Funnel, no route, `--public-url`, and a re-run on
+  this install's own Funnel or Cloudflare route stay Tychicus's own setup; `remote join` moves that route.
+- Tunnel setup in Local Studio is on its dev channel only. When `local-studio tunnel setup` answers `state: "waitlist"`
+  (with `url`, `next` and `channel`), Tychicus says so, gives the waitlist address, and sets up its own route; `--json`
+  puts the whole answer in `localStudio`. A `local-studio` that answers no JSON (a build from before tunnel setup) also
+  leaves Tychicus its own route. One that answers JSON and fails is a refusal with code `local_studio`.
+- Setup through Local Studio makes the passcode and connect code the way its own setup does: a passcode unless
+  `--no-passcode`, a connect code for `--connect-code` or a person at a terminal, and code `connect_code` when one asked
+  for can't be made. `remote test` and `remote fix` check a joined tailnet route from inside the tailnet.
 - An alias is an older address the same route still answers, such as the name a Tychicus Cloudflare route used before
   Local Studio adopted it. Serve answers OAuth on each alias as its own address: discovery, issuer, resource and the
   WWW-Authenticate challenge use the host the request came in on, and a token works only on the host that issued it.
@@ -304,9 +309,9 @@ what you can, so tick this only for an assistant you'd let sit at your keyboard.
 `remote status --json` and `remote setup --json` print one JSON object, so an app never reads
 sentences. `state` is one of `tailscale_missing`, `tailscale_signed_out`, `funnel_not_allowed` (with
 `adminUrl`, the page Tailscale printed), `funnel_closed` (status only), `cloudflared_missing`, `tailnet_lock`, `port_busy`, `ready`, `on` (with
-`connectorUrl`), `no_browser_connected`, `waitlist` (Local Studio's tunnel isn't open to this build yet) or `problem` (with `message`, and sometimes `code`).
+`connectorUrl`), `no_browser_connected` or `problem` (with `message`, and sometimes `code`).
 `setup --json` and `join --json` also give `step`, the agent's next move: `ready` (on), `joined` (on through Local
-Studio's route), `needs_signin` (Tailscale or Cloudflare sign-in), `needs_dns` (a name or DNS problem), `waitlist` or
+Studio's route), `needs_signin` (Tailscale or Cloudflare sign-in), `needs_dns` (a name or DNS problem) or
 `error` (with `code`). With stdin not a terminal they never prompt, so an agent can run setup for someone.
 `remote off`, `setup`, `fix` and `join` refuse, with code `service_belongs_to_other_config` and exit 1, when the
 installed serve or tunnel service names another config folder than this shell's (a run with TYCHICUS_CONFIG_DIR set

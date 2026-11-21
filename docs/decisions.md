@@ -1901,8 +1901,10 @@ a 200 ms sleep in click failed `market-evals`, and its revert passed.
 ## D57. One tunnel per machine, shared with Local Studio (Claude, 2026-11-21)
 
 **Decision.** Local Studio owns the one tunnel on a computer, on every route (hosted, Cloudflare, tailnet), and writes the
-route record. Tychicus only reads the record and joins (`remote join`); `remote setup` defers to `local-studio tunnel
-setup` where Local Studio is installed and passes a waitlist answer through unchanged. Standalone Tychicus keeps its own
+route record. Tychicus only reads the record and joins (`remote join`); `remote setup` joins where a record exists and
+otherwise defers to `local-studio tunnel setup` for a Cloudflare or tailnet route. Local Studio's waitlist answer (stable
+and nightly) or a build without tunnel setup leaves Tychicus its own route, and a Local Studio folder alone never
+diverts setup, since `install --local-studio` makes one. Standalone Tychicus keeps its own
 route with the same exact paths: a Cloudflare ingress of its nine paths then 404, or nine `tailscale serve` mounts on
 443. Aliases let the joined route keep answering an older name, with OAuth and tokens bound to each host.
 
