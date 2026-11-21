@@ -853,8 +853,9 @@ test("remote setup --cloudflare makes the tunnel and its record, runs both servi
 	assert.ok(calls.includes(`cloudflared tunnel route dns ${CF_ID} ${CF_HOST}`), calls.join("\n"));
 	assert.ok(!calls.some((x) => x.includes("--overwrite-dns")), "a name in use is never taken over");
 	const config = readFileSync(join(s.env.TABKYRA_CONFIG_DIR, "cloudflared.yml"), "utf8");
-	assert.match(config, new RegExp(`hostname: ${CF_HOST}\\n    service: http://127\\.0\\.0\\.1:${first.port}\\n`));
-	assert.match(config, /- service: http_status:404/);
+	// Exactly Tychicus's nine paths go to serve (docs/decisions.md, D57); the root and everything else is a 404.
+	const tychicusPaths = "^(?:/mcp|/\\.well-known/oauth-protected-resource|/\\.well-known/oauth-protected-resource/mcp|/\\.well-known/oauth-authorization-server|/\\.well-known/oauth-authorization-server/mcp|/authorize|/token|/register|/revoke)$";
+	assert.ok(config.includes(`  - hostname: ${CF_HOST}\n    path: ${tychicusPaths}\n    service: http://127.0.0.1:${first.port}\n  - service: http_status:404\n`), config);
 	assert.equal(JSON.parse(readFileSync(join(s.env.TABKYRA_CONFIG_DIR, "remote.json"), "utf8")).route, "cloudflare");
 	assert.ok(existsSync(cfService(s)));
 

@@ -22,7 +22,7 @@ import { COMPUTER_ACT_TOOLS, COMPUTER_READ_TOOLS, computerHelper, openComputer }
 import { argumentNeeds, type CallCheck, createMcpServer } from "./mcp.ts";
 import { MAX_LINK_SESSIONS, type RosterDevice } from "./link-protocol.ts";
 import { handleOAuth, readBody } from "./oauth-http.ts";
-import { liveGrantIds, type OAuthConfig, oauthStateFile, resourceMetadataUrl, verifyAccessToken } from "./oauth.ts";
+import { liveGrantIds, type OAuthConfig, oauthForHost, oauthStateFile, resourceMetadataUrl, verifyAccessToken } from "./oauth.ts";
 import { envVar } from "./env.ts";
 import { configDir } from "./files.ts";
 
@@ -477,20 +477,20 @@ export async function serve(options: ServeOptions): Promise<{ close: () => Promi
 	for (const file of watched) watchFile(file, { interval: 1000, persistent: false }, sweepSessions);
 
 	const oauth = options.oauth;
-	// Clients find the authorization server from this header (RFC 9728).
-	const challenge = oauth ? `Bearer realm="tabkyra", resource_metadata="${resourceMetadataUrl(oauth)}"` : 'Bearer realm="tabkyra"';
-	const deny = (res: ServerResponse, status: number, message: string) => {
-		res.writeHead(status, { "content-type": "application/json", ...(status === 401 ? { "www-authenticate": challenge } : {}) });
+	// Clients find the authorization server from this header (RFC 9728), on the address the request came to (an alias names its own).
+	const challenge = (view: OAuthConfig | undefined) => (view ? `Bearer realm="tabkyra", resource_metadata="${resourceMetadataUrl(view)}"` : 'Bearer realm="tabkyra"');
+	const deny = (res: ServerResponse, status: number, message: string, view: OAuthConfig | undefined = oauth) => {
+		res.writeHead(status, { "content-type": "application/json", ...(status === 401 ? { "www-authenticate": challenge(view) } : {}) });
 		res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message }, id: null }));
 	};
 
-	/** A static token, or with OAuth on, a live OAuth access token. */
-	function caller(header: string | undefined): Caller | undefined {
+	/** A static token, or with OAuth on, a live OAuth access token issued for this address (`view`). */
+	function caller(header: string | undefined, view: OAuthConfig | undefined = oauth): Caller | undefined {
 		const record = authenticate(header);
 		// A link token works only on the loopback serve `link run` starts; anywhere else it is no token at all.
 		if (record) return record.kind === "link" && !options.acceptLinkTokens ? undefined : record;
 		const m = /^Bearer (\S+)$/.exec(header ?? "");
-		return oauth && m ? verifyAccessToken(oauth, m[1]) : undefined;
+		return view && m ? verifyAccessToken(view, m[1]) : undefined;
 	}
 
 	const http = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -512,16 +512,25 @@ export async function serve(options: ServeOptions): Promise<{ close: () => Promi
 
 	async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
 		const path = new URL(req.url ?? "/", "http://x").pathname;
-		if (oauth) {
-			// Behind a tunnel only the public name and loopback are ours; anything else is a misdirected or rebound request.
+		// The OAuth config for the address this request came to: publicUrl's, or an alias's own (oauthForHost).
+		const view = oauth ? oauthForHost(oauth, req.headers.host) : undefined;
+		if (oauth && view) {
+			// Behind a tunnel only the public name, its aliases and loopback are ours; anything else is a misdirected or rebound request.
 			const host = String(req.headers.host ?? "").toLowerCase();
-			const allowed = new Set([new URL(oauth.publicUrl).host, `127.0.0.1:${port()}`, `localhost:${port()}`, `[::1]:${port()}`, ...(options.allowedHosts ?? []).map((h) => h.toLowerCase())]);
+			const allowed = new Set([
+				new URL(oauth.publicUrl).host,
+				...(oauth.aliases ?? []),
+				`127.0.0.1:${port()}`,
+				`localhost:${port()}`,
+				`[::1]:${port()}`,
+				...(options.allowedHosts ?? []).map((h) => h.toLowerCase()),
+			]);
 			if (!allowed.has(host)) return deny(res, 421, "Misdirected request.");
-			if (await handleOAuth(oauth, req, res, path)) return;
+			if (await handleOAuth(view, req, res, path)) return;
 		}
-		if (path !== "/mcp") return deny(res, 404, "Not found. The MCP endpoint is /mcp.");
-		const token = caller(req.headers.authorization);
-		if (!token) return deny(res, 401, oauth ? "Connect with OAuth or a valid, unrevoked bearer token." : `A valid, unrevoked bearer token is required (${COMMAND_NAME} token create).`);
+		if (path !== "/mcp") return deny(res, 404, "Not found. The MCP endpoint is /mcp.", view);
+		const token = caller(req.headers.authorization, view);
+		if (!token) return deny(res, 401, oauth ? "Connect with OAuth or a valid, unrevoked bearer token." : `A valid, unrevoked bearer token is required (${COMMAND_NAME} token create).`, view);
 		const sessionId = req.headers["mcp-session-id"];
 		const existing = typeof sessionId === "string" ? sessions.get(sessionId) : undefined;
 		if (existing) {

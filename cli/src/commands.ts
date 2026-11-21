@@ -246,14 +246,15 @@ export const COMMANDS: CommandSpec[] = [
 		subcommands: [
 			{
 				name: "setup",
-				what: "Tailscale Funnel (or a Cloudflare tunnel with --cloudflare, or your own --public-url), a passcode and a service that keeps serve running. In a terminal it asks and waits; --no-wait stops instead",
-				flags: ["--cloudflare", "--replace-funnel", "--public-url", "--port", "--no-service", "--no-passcode", "--tailscale", "--no-wait", "--no-input", "--yes", "--connect-code", "--json"],
+				what: "Tailscale Funnel (or a Cloudflare tunnel with --cloudflare, your tailnet only with --tailnet, or your own --public-url), a passcode and a service that keeps serve running. Where Local Studio is installed, Local Studio runs the tunnel (--cloudflare or --tailnet) and this joins it. In a terminal it asks and waits; --no-wait stops instead",
+				flags: ["--cloudflare", "--replace-funnel", "--public-url", "--port", "--no-service", "--no-passcode", "--tailscale", "--tailnet", "--no-wait", "--no-input", "--yes", "--connect-code", "--json"],
 				optionalValue: ["--cloudflare"],
 			},
 			{ name: "cloudflare", args: "login", max: 1, what: "Sign in to your own Cloudflare account, in your browser", flags: ["--json"] },
 			{ name: "status", what: "Is it up and reachable from the internet? Fast checks from this computer", flags: ["--json"] },
 			{ name: "test", what: "Prove an assistant can reach it, from outside: public DNS, TLS, the OAuth metadata, the sign-in challenge and a streaming probe", flags: ["--json"] },
 			{ name: "fix", what: "Repair what remote test or status found, one step at a time, asking first (--yes to skip asking, --dry-run to list)", flags: ["--yes", "--dry-run", "--json"] },
+			{ name: "join", what: "Join Local Studio's tunnel: serve on its route record's port and address, stop this install's own tunnel (the tunnel itself stays), prove it, and put everything back on failure", flags: ["--no-service", "--port", "--json"] },
 			{ name: "off", what: "Stop the service, close the tunnel or Funnel and remove remote.json", flags: ["--json"] },
 			{
 				name: "reset",
