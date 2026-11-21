@@ -220,12 +220,6 @@ export async function remoteFix(options: FixOptions): Promise<number> {
 		else console.error(`${sym.fail} ${message}`);
 		return EXIT_NEEDS_PERSON;
 	}
-	const foreign = serviceOfOtherConfig([SERVE_SERVICE, CLOUDFLARE_SERVICE]);
-	if (foreign) {
-		if (options.json) printReport({ ok: false, state: "problem", code: foreign.code, message: foreign.message, actions: [], advice: [] });
-		else console.error(`${sym.fail} ${foreign.message}`);
-		return EXIT_FAILED;
-	}
 
 	const done: FixAction[] = [];
 	let renamed: { oldUrl: string; newUrl: string } | undefined;
@@ -261,6 +255,10 @@ export async function remoteFix(options: FixOptions): Promise<number> {
 		const current = loadRemoteConfig() ?? config;
 		const d = await diagnose(current);
 		advice = d.advice;
+		// installService writes this shell's folder into the service file; a stale restart in place keeps the service's own (#41).
+		const rewrites = d.actions.filter((a) => !a.stale && (a.kind === "restart_serve" || a.kind === "restart_cloudflared"));
+		const foreign = serviceOfOtherConfig(rewrites.map((a) => (a.kind === "restart_serve" ? SERVE_SERVICE : CLOUDFLARE_SERVICE)));
+		if (foreign) return finish({ ok: false, state: "problem", code: foreign.code, message: foreign.message }, EXIT_FAILED);
 		if (current.route === "funnel") {
 			const ts = tailscaleReady();
 			funnelWhere = ts.ok && ts.state.kind === "ok" ? { bin: ts.bin, dns: ts.state.dns } : undefined;

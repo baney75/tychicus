@@ -814,6 +814,7 @@ test("off, setup, fix and join refuse a service set up for another config folder
 	const files = ["serve", "cloudflared"].map((which) => serviceFor(s, which, other));
 	const before = files.map((f) => readFileSync(f, "utf8"));
 	writeFileSync(join(s.config, "remote.json"), JSON.stringify({ publicUrl: `https://${CF_HOST}`, port: 18787, route: "cloudflare" }));
+	writeFileSync(join(s.config, "cloudflared.yml"), `tunnel: ${TUNNEL_ID}\ncredentials-file: /imported/${TUNNEL_ID}.json\n`, { mode: 0o600 });
 	const remoteBefore = s.remoteJsonText();
 	s.writeRecord({ v: 1, owner: "local-studio", route: "hosted", hostname: STUDIO, ports: { mcp: 18787 } });
 	const runs = [
@@ -838,7 +839,7 @@ test("off, setup, fix and join refuse a service set up for another config folder
 	assert.equal(deferred.json().code, "service_belongs_to_other_config", deferred.out);
 	assert.deepEqual(files.map((f) => readFileSync(f, "utf8")), before, "both service files are untouched");
 	assert.equal(s.remoteJsonText(), remoteBefore);
-	assert.deepEqual(s.calls().filter((x) => /^(launchctl|systemctl|cloudflared|tailscale serve --|tailscale funnel|local-studio)/.test(x)), [], s.calls().join("\n"));
+	assert.deepEqual(s.calls().filter((x) => /^(launchctl (?!print )|systemctl (?!--user is-active )|cloudflared|tailscale serve --|tailscale funnel|local-studio)/.test(x)), [], s.calls().join("\n"));
 	const text = await s.runAsync(["remote", "off"]);
 	assert.equal(text.code, 1);
 	assert.match(text.stderr, /belongs to another setup\. Nothing was changed/);
