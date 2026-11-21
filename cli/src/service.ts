@@ -144,7 +144,7 @@ export function savedFolders(spec: ServiceSpec): { config?: string; socket?: str
 	} catch {
 		return {};
 	}
-	const config = found.get("POLYCARP_BROWSER_CONFIG_DIR") ?? found.get("TABKYRA_CONFIG_DIR");
+	const config = found.get("TYCHICUS_CONFIG_DIR") ?? found.get("POLYCARP_BROWSER_CONFIG_DIR") ?? found.get("TABKYRA_CONFIG_DIR");
 	const socket = found.get("POLYCARP_SOCKET_DIR") ?? found.get("TABKYRA_SOCKET_DIR");
 	return { config: config && isAbsolute(config) ? config : undefined, socket: socket && isAbsolute(socket) ? socket : undefined };
 }
@@ -602,6 +602,29 @@ export function installServiceAsync(spec: ServiceSpec = SERVE_SERVICE, timeoutMs
 /** The service as it was named before the rename, shaped like a spec so the same file and log helpers work on it. */
 function legacySpec(spec: ServiceSpec): ServiceSpec | undefined {
 	return spec.legacy ? { ...spec, ...spec.legacy, legacy: undefined } : undefined;
+}
+
+const sameFolder = (a: string, b: string) => (realDir(a) ?? resolve(a)) === (realDir(b) ?? resolve(b));
+
+/**
+ * An installed service, under its name or its old one, that was set up for another config folder than this shell's: its plist or
+ * unit names that folder (setup always writes it, serviceEnvironment). Commands that stop, remove or replace a service refuse it,
+ * because that service is another setup's, as when a test or scratch run sets TYCHICUS_CONFIG_DIR but shares HOME with the
+ * person's own install. A file that names no folder can't be told apart, so it is left to the commands as before.
+ */
+export function serviceOfOtherConfig(specs: ServiceSpec[]): { code: "service_belongs_to_other_config"; message: string } | undefined {
+	const here = configDir();
+	for (const spec of specs.flatMap((s) => [s, legacySpec(s)].filter((x): x is ServiceSpec => x !== undefined))) {
+		const file = serviceFile(spec);
+		if (!file || !existsSync(file)) continue;
+		const saved = savedFolders(spec).config;
+		if (!saved || sameFolder(saved, here)) continue;
+		return {
+			code: "service_belongs_to_other_config",
+			message: `${file} runs ${COMMAND_NAME} with the config folder ${saved}, not this one (${here}), so it belongs to another setup. Nothing was changed. To change that service, run this again with TYCHICUS_CONFIG_DIR=${saved}.`,
+		};
+	}
+	return undefined;
 }
 
 /** True when a service under the old name is installed here. */

@@ -8,6 +8,7 @@
  * tokens are checked, so a failed delete heals itself. Its secret is never printed, logged or put in a report.
  */
 import { randomBytes } from "node:crypto";
+import { lookup as systemLookup } from "node:dns/promises";
 import type { IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
@@ -57,10 +58,16 @@ export interface RemoteTestHooks {
 	reachable?: (address: string) => boolean;
 	/** Runs right after the probe token is made, before it is used. */
 	afterMint?: () => void;
+	/** On the tailnet route: true for an address that counts as a tailnet one (a fake server on 127.0.0.1). */
+	tailnet?: (address: string) => boolean;
+	/** On the tailnet route: this computer's resolver, replaced (a test's name for 127.0.0.1). */
+	resolve?: (host: string) => Promise<string[]>;
+	/** `remote join`'s proof for one address, replaced whole (a test with no public server behind the record's hostname). */
+	proof?: (publicUrl: string) => Promise<ProofCheck[]>;
 }
 
 const HOOKS = Symbol.for("polycarp.remote-test.hooks");
-const preloadedHooks = (): RemoteTestHooks => ((globalThis as Record<symbol, unknown>)[HOOKS] as RemoteTestHooks | undefined) ?? {};
+export const preloadedHooks = (): RemoteTestHooks => ((globalThis as Record<symbol, unknown>)[HOOKS] as RemoteTestHooks | undefined) ?? {};
 
 type Lookup = (hostname: string, options: { all?: boolean }, callback: (...args: unknown[]) => void) => void;
 
@@ -328,14 +335,20 @@ export function authMetadataProblems(body: Record<string, unknown>, publicUrl: s
  * Every check, in order. DNS and TLS come first because nothing after them can run without an address that answers; the rest
  * all run so one report names every problem. `streaming: false` leaves out the probe (and its token).
  */
-export async function publicChecks(publicUrl: string, options: { streaming?: boolean; hooks?: RemoteTestHooks } = {}): Promise<ProofCheck[]> {
+export async function publicChecks(publicUrl: string, options: { streaming?: boolean; hooks?: RemoteTestHooks; tailnet?: boolean } = {}): Promise<ProofCheck[]> {
 	const hooks = options.hooks ?? preloadedHooks();
 	const reachable = (address: string) => !privateAddress(address) || hooks.reachable?.(address) === true;
 	const url = new URL(publicUrl);
 	const host = url.hostname;
 	const checks: ProofCheck[] = [];
 	let address: string;
-	if (isIP(host)) {
+	if (options.tailnet) {
+		// The tailnet route is reached from inside the tailnet: this computer's resolver (MagicDNS) and a tailnet address, never public DNS.
+		const dns = await tailnetDnsCheck(host, hooks);
+		checks.push(dns.check);
+		if (!dns.address) return checks;
+		address = dns.address;
+	} else if (isIP(host)) {
 		address = host;
 		checks.push({ name: "dns", status: reachable(host) ? "ok" : "fail", detail: `${host} is an address`, ...(reachable(host) ? {} : { next: "Use a public name for the connector (remote setup)." }) });
 	} else {
@@ -446,3 +459,34 @@ export const tunnelPending = (checks: ProofCheck[]) => checks.find(gatewayPendin
 
 /** The connector answers from outside: public DNS, a valid certificate and this connector's metadata. Past that, a failure is a real fault. */
 export const answersFromOutside = (checks: ProofCheck[]) => ["dns", "tls", "resource_metadata"].every((name) => checks.some((c) => c.name === name && c.status === "ok"));
+
+/** A Tailscale address: 100.64.0.0/10, or the tailnet's IPv6 range fd7a:115c:a1e0::/48. */
+export const tailnetAddress = (address: string) => inTailnetRange(address) || /^fd7a:115c:a1e0:/i.test(address);
+
+/**
+ * The dns step on the tailnet route: the name through this computer's own resolver, which must give a tailnet address. The check
+ * says it ran from inside the tailnet, because that is all it can show: no device off the tailnet reaches this route.
+ */
+export async function tailnetDnsCheck(host: string, hooks: RemoteTestHooks = preloadedHooks()): Promise<{ check: ProofCheck; address?: string }> {
+	const isTailnet = (a: string) => tailnetAddress(a) || hooks.tailnet?.(a) === true;
+	let addresses: string[];
+	try {
+		addresses = hooks.resolve ? await hooks.resolve(host) : (await systemLookup(host, { all: true })).map((a) => a.address);
+	} catch (err) {
+		return {
+			check: { name: "dns", status: "fail", pending: true, detail: `this computer's resolver couldn't find ${host} (checked from inside your tailnet): ${err instanceof Error ? err.message : String(err)}`, next: "Check that Tailscale is signed in here and MagicDNS is on, then run remote test again." },
+		};
+	}
+	const inside = addresses.filter(isTailnet).sort((a, b) => (isIP(a) === 4 ? 0 : 1) - (isIP(b) === 4 ? 0 : 1));
+	if (!inside.length) {
+		return {
+			check: {
+				name: "dns",
+				status: "fail",
+				detail: `${host} resolves here to ${addresses.join(", ") || "nothing"}, not a tailnet address (checked from inside your tailnet, with this computer's resolver)`,
+				next: "The tailnet route is reached over Tailscale. Check that Tailscale is signed in here and MagicDNS is on, then run remote test again.",
+			},
+		};
+	}
+	return { address: inside[0], check: { name: "dns", status: "ok", detail: `${host} resolves to ${inside.join(", ")} on your tailnet (checked from inside the tailnet, with this computer's resolver; devices off the tailnet can't reach it)` } };
+}

@@ -29,6 +29,7 @@ import { connectionChecks } from "./doctor.ts";
 import { ensureLauncherIsSelf } from "./install.ts";
 import { ask, askYes, closeInput, duration, openPage, waitMs } from "./remote-guide.ts";
 import {
+	agentStep,
 	CLOUDFLARED_DOWNLOAD_URL,
 	completeFunnelAdminUrl,
 	funnelAdminUrl,
@@ -50,12 +51,12 @@ import {
 	tailscaleAccessDenied,
 	tailscaleDownloadUrl,
 } from "./remote-state.ts";
-import { installService, removeService, run, runAsync, serviceFile, serviceLogHint, serviceRunning, sleep, writeAtomic } from "./service.ts";
+import { installService, removeService, run, runAsync, SERVE_SERVICE, serviceFile, serviceLogHint, serviceOfOtherConfig, serviceRunning, sleep, writeAtomic } from "./service.ts";
 import { configDir, listClients, mintApprovalCode, passcodeSet, setPasscode } from "./oauth.ts";
 import { hubFile } from "./hub-state.ts";
 import { DohAnswerError, dohAddresses } from "./doh.ts";
 import { isIP } from "node:net";
-import { answersFromOutside, gatewayPending, type ProofCheck, privateAddress, publicChecks, realFault, tunnelPending } from "./remote-test.ts";
+import { answersFromOutside, gatewayPending, type ProofCheck, privateAddress, publicChecks, realFault, tailnetDnsCheck, tunnelPending } from "./remote-test.ts";
 import { DEFAULT_PORT } from "./tunnel.ts";
 import { tailscaleAppPath, tailscaleBinary } from "./tailscale.ts";
 
@@ -64,51 +65,15 @@ import { c, sym } from "./ui.ts";
 import { COMMAND_NAME } from "./self.ts";
 import { envVar } from "./env.ts";
 import { windowsInstallPaths } from "./tool-paths.ts";
+import { loadRemoteConfig, type RemoteConfig, reachedOnTailnet, remoteFile, saveRemoteConfig } from "./remote-config.ts";
+import { type RouteRecord, readRouteRecord, routeRecordFile, TYCHICUS_PATHS } from "./route-record.ts";
+import { applyMounts, funnelOn443, handlersOn443, type Mount, mountTarget, planMounts, readServeState, removeMounts, type ServeState, wantedMounts } from "./tailnet.ts";
+import { cloudflareTunnelPaths, setupThroughLocalStudio } from "./remote-join.ts";
 
 /** Funnel's own port: keeps the OAuth paths at the root and anything on 443 private. */
 export const FUNNEL_PORT = 8443;
 
-export interface RemoteConfig {
-	publicUrl: string;
-	port: number;
-	route: "funnel" | "custom" | "cloudflare";
-	redirectHosts?: string[];
-	allowHosts?: string[];
-}
-
-export const remoteFile = () => join(configDir(), "remote.json");
-
-const stringList = (value: unknown, field: string): string[] | undefined => {
-	if (value === undefined) return undefined;
-	if (!Array.isArray(value) || !value.every((x) => typeof x === "string")) throw new Error(`${remoteFile()}: ${field} must be a list of strings.`);
-	return value as string[];
-};
-
-/**
- * remote.json (or `file`, another config folder's, such as the one a service was set up with), or undefined when it doesn't
- * exist. A file that exists but is wrong throws, so serve never silently drops it.
- */
-export function loadRemoteConfig(file: string = remoteFile()): RemoteConfig | undefined {
-	if (!existsSync(file)) return undefined;
-	let raw: Record<string, unknown>;
-	try {
-		raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-	} catch {
-		throw new Error(`${file} isn't valid JSON. Run ${COMMAND_NAME} remote off to remove it, then ${COMMAND_NAME} remote setup again.`);
-	}
-	if (!raw || typeof raw !== "object") throw new Error(`${file} isn't a Tychicus remote file.`);
-	if (typeof raw.publicUrl !== "string" || !raw.publicUrl) throw new Error(`${file}: publicUrl is missing.`);
-	if (typeof raw.port !== "number" || !Number.isInteger(raw.port) || raw.port < 0 || raw.port > 65535) throw new Error(`${file}: port must be a port number.`);
-	if (raw.route !== "funnel" && raw.route !== "custom" && raw.route !== "cloudflare") throw new Error(`${file}: route must be funnel, custom or cloudflare.`);
-	const redirectHosts = stringList(raw.redirectHosts, "redirectHosts");
-	const allowHosts = stringList(raw.allowHosts, "allowHosts");
-	return { publicUrl: raw.publicUrl, port: raw.port, route: raw.route, ...(redirectHosts ? { redirectHosts } : {}), ...(allowHosts ? { allowHosts } : {}) };
-}
-
-export function saveRemoteConfig(config: RemoteConfig): void {
-	mkdirSync(configDir(), { recursive: true, mode: 0o700 });
-	writeAtomic(remoteFile(), `${JSON.stringify(config, null, "\t")}\n`, 0o600);
-}
+export { loadRemoteConfig, type RemoteConfig, remoteFile, saveRemoteConfig };
 
 // ---------- Tailscale Funnel ----------
 
@@ -214,15 +179,27 @@ export function tailscaleReady(): TailscaleReady {
 }
 
 /** `tailscaleReady` for the native host: the same answer, without blocking it. */
-export async function tailscaleReadyAsync(seam: ProbeSeam = {}): Promise<TailscaleReady> {
+export async function tailscaleReadyAsync(seam: ProbeSeam = {}, funnel = true): Promise<TailscaleReady> {
 	const exec = seam.run ?? probeRun;
 	const bin = (seam.tailscale ?? tailscaleBinary)();
 	if (!bin) return tailscaleAbsent();
-	const lock = await exec(bin, ["lock", "status"]);
-	if (lock.timedOut) return readyFrom(bin, tailscaleSilent());
-	if (tailnetLocked(lock.out)) return TAILNET_LOCKED;
+	// Tailnet Lock stops Funnel only; the tailnet route (`funnel` false) never leaves the tailnet, so it doesn't ask.
+	if (funnel) {
+		const lock = await exec(bin, ["lock", "status"]);
+		if (lock.timedOut) return readyFrom(bin, tailscaleSilent());
+		if (tailnetLocked(lock.out)) return TAILNET_LOCKED;
+	}
 	return readyFrom(bin, await readTailscaleAsync(bin, exec));
 }
+
+/** The Tailscale part of the tailnet route: installed and signed in. Tailnet Lock doesn't matter there: serve never leaves the tailnet. */
+function tailnetReady(): TailscaleReady {
+	const bin = tailscaleBinary();
+	if (!bin) return tailscaleAbsent();
+	return readyFrom(bin, readTailscale(bin));
+}
+
+const serveState = (state: Extract<TailscaleState, { kind: "ok" }>): ServeState => ({ dns: state.dns, web: state.web, tcp: state.tcp, allowFunnel: state.allowFunnel });
 
 /** Everything that can refuse Funnel, checked before anything changes. `ports` are the local ports that count as ours on 8443. */
 export function planFunnel(ports: number[]): FunnelPlan {
@@ -457,6 +434,8 @@ export interface SetupOptions {
 	cloudflare?: string;
 	/** --tailscale: the Funnel route, chosen outright, so nothing asks which route. */
 	tailscale?: boolean;
+	/** --tailnet: `tailscale serve` on 443 for this tailnet only, never Funnel (issue #31). */
+	tailnet?: boolean;
 	port?: number;
 	service: boolean;
 	/** False (--no-passcode) mints and prints no passcode; the one-time connect code is the way in. For an agent's shell. */
@@ -614,7 +593,15 @@ async function askCloudflareHost(say: (line: string) => void): Promise<string | 
 
 export async function remoteSetup(options: SetupOptions): Promise<number> {
 	try {
-		return await runSetup(options);
+		// One tunnel per machine (D57): where Local Studio runs the tunnel, Tychicus joins it. --public-url is the person's own front door.
+		if (options.publicUrl) return await runSetup(options);
+		const via = await setupThroughLocalStudio(options);
+		if (typeof via === "number") return via;
+		// Its own route instead; an app also gets Local Studio's waitlist answer, so it can show where to sign up.
+		const answer = via.localStudio;
+		const emit = options.report ?? printReport;
+		const json = options.json === true || options.report !== undefined;
+		return await runSetup(answer && json ? { ...options, report: (report) => emit({ ...report, localStudio: answer }) } : options);
 	} finally {
 		closeInput();
 	}
@@ -624,7 +611,7 @@ async function runSetup(options: SetupOptions): Promise<number> {
 	const json = options.json === true || options.report !== undefined;
 	const wait = !json && options.wait === true;
 	const input = !json && options.input === true;
-	const emit = options.report ?? printReport;
+	const emit = (report: SetupReport) => (options.report ?? printReport)({ ...report, step: agentStep(report) });
 	/** The passcode this run made. A run that fails after making it still reports it, because a later run won't print it again. */
 	let madePasscode: string | undefined;
 	const say = (line: string) => {
@@ -658,6 +645,8 @@ async function runSetup(options: SetupOptions): Promise<number> {
 	if (existsSync(hubFile())) {
 		return fail("problem", `This install is set up as a hub (${hubFile()}), and an install has one public route. Run ${COMMAND_NAME} hub off first. Nothing was changed.`, { code: "hub" });
 	}
+	const foreign = serviceOfOtherConfig([SERVE_SERVICE, CLOUDFLARE_SERVICE]);
+	if (foreign) return fail("problem", foreign.message, { code: foreign.code });
 	let previous: RemoteConfig | undefined;
 	try {
 		previous = loadRemoteConfig();
@@ -671,9 +660,14 @@ async function runSetup(options: SetupOptions): Promise<number> {
 	let funnelBin = "";
 	let funnelDns = "";
 	let cloudflaredBin = "";
+	// The tailnet route: its tailscale, its plan for port 443, and the mounts it wants.
+	let tailnetBin = "";
+	let tailnetPlan: Extract<ReturnType<typeof planMounts>, { ok: true }> | undefined;
+	let tailnetWanted: Mount[] = [];
+	const tailnet = (options.tailnet === true || (previous?.route === "tailnet" && !options.publicUrl && !options.tailscale && options.cloudflare === undefined));
 	// `remote setup` again on this route picks up where a failed run stopped, with the name it already has.
-	let cloudflareName = options.cloudflare ?? (previous?.route === "cloudflare" && !options.publicUrl && !options.tailscale ? new URL(previous.publicUrl).hostname : undefined);
-	if (input && !previous && cloudflareName === undefined && !options.publicUrl && !options.tailscale) {
+	let cloudflareName = tailnet ? undefined : (options.cloudflare ?? (previous?.route === "cloudflare" && !options.publicUrl && !options.tailscale ? new URL(previous.publicUrl).hostname : undefined));
+	if (input && !previous && !tailnet && cloudflareName === undefined && !options.publicUrl && !options.tailscale) {
 		const choice = await chooseRoute(say, port);
 		if (choice === undefined) return fail("problem", `No route was chosen, so nothing was changed. Run ${COMMAND_NAME} remote setup --tailscale, or --cloudflare name.yourdomain.com.`);
 		if (choice === "cloudflare") cloudflareName = "";
@@ -691,7 +685,28 @@ async function runSetup(options: SetupOptions): Promise<number> {
 	const cloudflareHost = cloudflareName === undefined ? undefined : normalizeCloudflareHost(cloudflareName);
 	if (cloudflareName !== undefined && !cloudflareHost) return fail("problem", `${cloudflareName} isn't a name a tunnel can have. Use one like tychicus.yourdomain.com.`, { code: "cloudflare_dns", next: { kind: "choose_name" } });
 	if (previous?.route === "cloudflare" && !cloudflareHost) return fail("problem", `A Cloudflare tunnel from an earlier setup is on. Run ${COMMAND_NAME} remote off first.`);
-	if (cloudflareHost) {
+	if (previous?.route === "tailnet" && !tailnet) return fail("problem", `The tailnet route from an earlier setup is on. Run ${COMMAND_NAME} remote off first.`);
+	if (tailnet) {
+		if (previous?.route === "funnel") return fail("problem", `Funnel from an earlier setup is on. Run ${COMMAND_NAME} remote off first.`);
+		const ready = tailnetReady();
+		if (!ready.ok) {
+			const next = nextFor(ready.state);
+			return fail(ready.state, ready.message, { ...(ready.code ? { code: ready.code } : {}), ...(next ? { next } : {}) });
+		}
+		if (ready.state.kind !== "ok") return fail("problem", ready.state.kind === "unreadable" ? (ready.state.why ?? "Couldn't read tailscale serve status, so nothing was changed.") : "Couldn't read tailscale, so nothing was changed.", { code: "tailnet" });
+		const stray = await strayFunnel();
+		if (stray.kind !== "none") return fail("port_busy", `Funnel on ${FUNNEL_PORT} is on${stray.kind === "unknown" ? ` (${stray.message})` : ""}, and a machine has one route. Run ${COMMAND_NAME} remote off first. Nothing was changed.`, { code: "tailscale_port" });
+		const dns = ready.state.dns;
+		tailnetWanted = wantedMounts(port);
+		// Mounts an earlier setup of this route made for another port are ours to move; anything else on these paths is a refusal.
+		const earlier = new Set(previous?.route === "tailnet" ? wantedMounts(previous.port).map((m) => `${m.path} ${m.target}`) : []);
+		const plan = planMounts(serveState(ready.state), tailnetWanted, (path, proxy) => earlier.has(`${path} ${proxy}`));
+		if (!plan.ok) return fail("port_busy", plan.message, { code: plan.code });
+		tailnetBin = ready.bin;
+		tailnetPlan = plan;
+		publicUrl = `https://${dns}`;
+		route = "tailnet";
+	} else if (cloudflareHost) {
 		if (previous?.route === "funnel" && !options.replaceFunnel) return fail("problem", `Funnel from an earlier setup is on. Run ${COMMAND_NAME} remote off first.`);
 		if (!options.service) return fail("problem", "The Cloudflare route runs as a service, so --no-service doesn't apply.");
 		let bin = cloudflaredBinary();
@@ -838,11 +853,11 @@ async function runSetup(options: SetupOptions): Promise<number> {
 			}
 			listening = true;
 		}
-		if (!listening && (route === "funnel" || json)) {
+		if (!listening && (route === "funnel" || route === "tailnet" || json)) {
 			// Nothing answers on the port: Funnel stays closed (or, on your own route, there is nothing to reach), so this is not "on".
 			return fail(
 				"problem",
-				`Nothing is listening on 127.0.0.1:${port} yet, so ${route === "funnel" ? "Funnel was not opened" : "remote access isn't on"}. remote.json is kept. Start ${COMMAND_NAME} serve (it reads remote.json), then run ${COMMAND_NAME} remote setup --no-service again.`,
+				`Nothing is listening on 127.0.0.1:${port} yet, so ${route === "funnel" ? "Funnel was not opened" : route === "tailnet" ? "the tailnet paths were not mounted" : "remote access isn't on"}. remote.json is kept. Start ${COMMAND_NAME} serve (it reads remote.json), then run ${COMMAND_NAME} remote setup --no-service again.`,
 				{ code: "serve" },
 			);
 		}
@@ -851,6 +866,12 @@ async function runSetup(options: SetupOptions): Promise<number> {
 			const service = await installService(CLOUDFLARE_SERVICE);
 			if (!service.ok) return fail("problem", `The Cloudflare tunnel didn't start: ${service.message}`, { code: "service" });
 			say(`${sym.ok} Cloudflare tunnel ${tunnelName} on ${publicUrl} ${c.dim(`-> 127.0.0.1:${port}`)}`);
+		}
+		if (route === "tailnet" && tailnetPlan) {
+			stage = "tailnet";
+			const mounted = applyMounts(tailnetBin, tailnetPlan, tailnetWanted);
+			if (!mounted.ok) return fail("problem", `tailscale serve didn't mount the tailnet paths: ${mounted.message} remote.json is kept; fix that, then run ${COMMAND_NAME} remote setup --tailnet again.`, { code: "tailnet" });
+			say(`${sym.ok} Tailscale serve on ${publicUrl}, your tailnet only ${c.dim(`(${TYCHICUS_PATHS.length} paths -> 127.0.0.1:${port})`)}`);
 		}
 		stage = "funnel";
 		if (route === "funnel") {
@@ -891,7 +912,9 @@ async function runSetup(options: SetupOptions): Promise<number> {
 		// reaches it, and setup says so instead of failing.
 		const host = new URL(publicUrl).hostname.replace(/^\[|\]$/g, "");
 		const localOnly = isIP(host) !== 0 && privateAddress(host);
-		let proof = await publicChecks(publicUrl);
+		const onTailnet = route === "tailnet";
+		const reach = onTailnet ? "on your tailnet" : "from the internet";
+		let proof = await publicChecks(publicUrl, { tailnet: onTailnet });
 		// The name resolves and has a certificate, but the tunnel or gateway in front of serve answers 502 to 530 or nothing: right
 		// after a Tailscale or Cloudflare tunnel starts it does that for a minute.
 		const plan = localOnly || realFault(proof) || !tunnelPending(proof) ? undefined : tunnelPlan(route, wait);
@@ -900,11 +923,11 @@ async function runSetup(options: SetupOptions): Promise<number> {
 			say(`Waiting for the tunnel in front of ${publicUrl} to connect (${tunnelPending(proof)?.detail}), up to ${duration(Math.max(0, publicDeadline - Date.now()))}.`);
 			while (tunnelPending(proof) && !realFault(proof) && Date.now() + every < publicDeadline) {
 				await sleep(every);
-				proof = await publicChecks(publicUrl);
+				proof = await publicChecks(publicUrl, { tailnet: onTailnet });
 			}
 		}
 		const up = answersFromOutside(proof);
-		say(`\nFrom the internet, as an assistant sees it:`);
+		say(onTailnet ? `\nFrom inside your tailnet (this computer's resolver and a tailnet address), as your tailnet devices see it:` : `\nFrom the internet, as an assistant sees it:`);
 		for (const line of proofLines(proof)) say(line);
 		const fault = localOnly ? undefined : realFault(proof);
 		const stuck = localOnly || fault ? undefined : tunnelPending(proof);
@@ -915,18 +938,19 @@ async function runSetup(options: SetupOptions): Promise<number> {
 			const waited = plan === "poll";
 			const what = waited ? `hasn't connected by the deadline` : `hasn't connected yet`;
 			const then = waited ? `Run ${COMMAND_NAME} remote fix to restart it, then ${COMMAND_NAME} remote test.` : `A new tunnel takes a minute: run ${COMMAND_NAME} remote test, and ${COMMAND_NAME} remote fix if it stays.`;
-			return fail("problem", `${connectorUrl} isn't usable from the internet: the tunnel in front of serve ${what} (${stuck.name}: ${stuck.detail}). ${then} remote.json is kept.`, {
+			return fail("problem", `${connectorUrl} isn't usable ${reach}: the tunnel in front of serve ${what} (${stuck.name}: ${stuck.detail}). ${then} remote.json is kept.`, {
 				code: stuck.name,
 				checks: proof,
 				next: { kind: "run_command", command: `${COMMAND_NAME} remote ${waited ? "fix" : "test"}` },
 			});
 		}
 		if (fault) {
-			const where = up ? `${connectorUrl} answers from the internet, but` : `${connectorUrl} isn't usable from the internet:`;
+			const where = up ? `${connectorUrl} answers ${reach}, but` : `${connectorUrl} isn't usable ${reach}:`;
 			return fail("problem", `${where} ${fault.name} failed: ${fault.detail}. ${fault.next ?? ""} remote.json is kept.`.replace(/\s+remote\.json/, " remote.json"), { code: fault.name, checks: proof });
 		}
 		if (localOnly) say(`${sym.warn} ${host} is a private address, so only this computer or its network reaches the connector; assistants on the internet can't.`);
-		else if (!up) say(`${sym.warn} It doesn't answer from the internet yet. A new name takes a few minutes; then run ${COMMAND_NAME} remote test.`);
+		else if (!up) say(`${sym.warn} It doesn't answer ${reach} yet. A new name takes a few minutes; then run ${COMMAND_NAME} remote test.`);
+		if (onTailnet) say(`${sym.warn} Tailnet only: claude.ai, ChatGPT and grok.com reach connectors from the internet, so they can't use this address. Agents on your tailnet devices can.`);
 		// The one-time connect code a new assistant needs (the passcode alone is refused for one, issue #97). Made for a person at a
 		// terminal, or when --connect-code asks; never printed unasked into an agent's shell or a log, where it would sit live.
 		let connect: { code: string; expiresAt: number } | undefined;
@@ -1140,16 +1164,25 @@ export async function remoteStatus(options: { json: boolean }, seam: ProbeSeam =
 	// Tailscale is read once, with the probes' 15 s limit, so a hung daemon is answered as one well inside the Mac app's wait on
 	// this command, not after a minute as "signed out" (PR 136 r2 first-F1). The routes and the preflight come from the same read,
 	// so a plain-text status off the Funnel route doesn't ask.
-	const ready = config?.route === "funnel" || options.json ? await tailscaleReadyAsync(seam) : undefined;
+	const onTailnet = config?.route === "tailnet";
+	const ready = config?.route === "funnel" || onTailnet || options.json ? await tailscaleReadyAsync(seam, !onTailnet) : undefined;
 	// On the Funnel route, Tailscale going away (quit, signed out, uninstalled, Tailnet Lock turned on) is the first thing to say, and
-	// nothing past it can work, so the internet-side checks are skipped.
-	const blocked = config?.route === "funnel" ? ready : undefined;
+	// nothing past it can work, so the internet-side checks are skipped. The same on the tailnet route, without Tailnet Lock.
+	const blocked = config?.route === "funnel" || onTailnet ? ready : undefined;
 	let tailscale: { state: RemoteState; message: string; code?: string } | undefined = blocked && !blocked.ok ? { state: blocked.state, message: blocked.message } : undefined;
 	// Tailscale didn't answer in time: say so, with the code that keeps checking, never "on".
 	if (blocked?.ok && blocked.state.kind === "unreadable" && blocked.state.code) {
 		tailscale = { state: "problem", message: blocked.state.why ?? "Tailscale didn't answer.", code: blocked.state.code };
 	}
-	if (blocked?.ok && config && blocked.state.kind === "ok") {
+	if (blocked?.ok && config?.route === "tailnet" && blocked.state.kind === "ok") {
+		// Signed in, but 443 doesn't mount the connector's paths here (taken down in Tailscale), or Funnel made them public.
+		const state = serveState(blocked.state);
+		const handlers = handlersOn443(state);
+		const missing = TYCHICUS_PATHS.filter((path) => handlers[path]?.Proxy !== mountTarget(config.port, path));
+		if (funnelOn443(state)) tailscale = { state: "problem", code: "tailnet_funnel", message: "Funnel is on for port 443, so the tailnet route's paths are public, not tailnet-only. Turn Funnel off for port 443 in Tailscale." };
+		else if (missing.length) tailscale = { state: "problem", code: "tailnet", message: `tailscale serve doesn't send ${missing.join(", ")} to 127.0.0.1:${config.port}, so your tailnet can't reach the connector. Run ${COMMAND_NAME} remote setup --tailnet again.` };
+	}
+	if (blocked?.ok && config?.route === "funnel" && blocked.state.kind === "ok") {
 		// Signed in, but Funnel isn't open for the address remote.json names (turned off in Tailscale, or an earlier refusal never retried):
 		// the connector can't be reached from the internet, whatever else answers.
 		const address = new URL(config.publicUrl);
@@ -1186,12 +1219,15 @@ export async function remoteStatus(options: { json: boolean }, seam: ProbeSeam =
 					? `${where} answers with resource ${config.publicUrl}/mcp`
 					: `${where} ${local.state === "none" ? "didn't answer: connection refused" : local.detail}. Is ${COMMAND_NAME} serve running? ${COMMAND_NAME} remote setup starts it.`,
 		});
-		checks.push(await dnsCheck(new URL(config.publicUrl).hostname));
+		if (onTailnet) {
+			const dns = await tailnetDnsCheck(new URL(config.publicUrl).hostname);
+			checks.push({ name: "tailnet DNS", status: dns.check.status, detail: dns.check.detail });
+		} else checks.push(await dnsCheck(new URL(config.publicUrl).hostname));
 		const pub = await metadata(`${config.publicUrl}${METADATA_PATH}`, 10_000, config.publicUrl);
-		checks.push({ name: "public fetch", status: pub.ok ? "ok" : "fail", detail: pub.detail });
+		checks.push({ name: onTailnet ? "tailnet fetch" : "public fetch", status: pub.ok ? "ok" : "fail", detail: pub.detail });
 		// This fetch used this computer's resolver. On a tailnet that answers a ts.net name with a tailnet address, so it can pass
 		// while the internet can't reach the connector. `remote test` asks public DNS and connects to that address instead.
-		if (await answeredInsideTailnet(new URL(config.publicUrl).hostname)) {
+		if (!onTailnet && (await answeredInsideTailnet(new URL(config.publicUrl).hostname))) {
 			checks.push({ name: "public test", status: "warn", detail: `this computer can reach ${new URL(config.publicUrl).hostname} over your tailnet, so the fetch above can't tell whether the internet can. ${COMMAND_NAME} remote test checks from outside.` });
 		}
 		try {
@@ -1201,6 +1237,8 @@ export async function remoteStatus(options: { json: boolean }, seam: ProbeSeam =
 		}
 		checks.push({ name: "OAuth clients", status: clients ? "ok" : "warn", detail: clients ? `${clients} registered (${COMMAND_NAME} token clients)` : "none yet; add the connector in claude.ai, ChatGPT or grok.com" });
 	}
+	const studio = localStudioStatus(config);
+	if (studio.check) checks.push(studio.check);
 	// Linux only, both warnings: without operator rights setup can't open Funnel again, and without lingering the service stops at logout.
 	if (config?.route !== "cloudflare" && config?.route !== "custom") {
 		const operator = operatorWarning(tailscaleBinary());
@@ -1226,6 +1264,9 @@ export async function remoteStatus(options: { json: boolean }, seam: ProbeSeam =
 			routes,
 			publicUrl: config?.publicUrl ?? null,
 			connectorUrl: config ? `${config.publicUrl}/mcp` : null,
+			localStudio: studio.json,
+			// For Local Studio's adopt step: where this install's own Cloudflare tunnel is, by path only.
+			cloudflare: cloudflareTunnelPaths(config) ?? null,
 			passcodeSet: passcodeSet(),
 			extensionConnected: extensionConnected ?? null,
 			oauthClients: clients,
@@ -1238,6 +1279,33 @@ export async function remoteStatus(options: { json: boolean }, seam: ProbeSeam =
 		console.log(`${mark} ${check.name.padEnd(13)} ${c.dim(check.detail)}`);
 	}
 	return ok ? 0 : 1;
+}
+
+/**
+ * Local Studio's route record as `remote status` shows it: its route, and whether this install joined it (remote.json is the custom
+ * route on the record's hostname and port). A record that can't be read is a failed check naming its file.
+ */
+export function localStudioStatus(config: RemoteConfig | undefined): {
+	check?: Check;
+	json: null | { route: RouteRecord["route"]; hostname: string; aliases: string[]; mcpPort: number; joined: boolean };
+} {
+	let record: RouteRecord | undefined;
+	try {
+		record = readRouteRecord();
+	} catch (err) {
+		return { check: { name: "local studio", status: "fail", code: "route_record", detail: err instanceof Error ? err.message : String(err) }, json: null };
+	}
+	if (!record) return { json: null };
+	const joined = config?.route === "custom" && config.publicUrl === `https://${record.hostname}` && config.port === record.ports.mcp;
+	const aliases = record.aliases ?? [];
+	const json = { route: record.route, hostname: record.hostname, aliases, mcpPort: record.ports.mcp, joined };
+	const also = aliases.length ? ` (also ${aliases.join(", ")})` : "";
+	return {
+		json,
+		check: joined
+			? { name: "local studio", status: "ok", detail: `joined Local Studio's ${record.route} route ${record.hostname}${also}: /mcp to 127.0.0.1:${record.ports.mcp}` }
+			: { name: "local studio", status: "warn", detail: `Local Studio runs a ${record.route} route for ${record.hostname}${also}, and this install hasn't joined it. ${COMMAND_NAME} remote join joins it.` },
+	};
 }
 
 // ---------- remote test ----------
@@ -1287,22 +1355,24 @@ export async function remoteTest(options: { json: boolean }): Promise<number> {
 		else console.error(`${sym.fail} ${message}`);
 		return EXIT_NEEDS_PERSON;
 	}
-	const checks = frontDoorNext(await publicChecks(config.publicUrl), config);
+	const onTailnet = reachedOnTailnet(config);
+	const checks = frontDoorNext(await publicChecks(config.publicUrl, { tailnet: onTailnet }), config);
 	const failed = checks.find((x) => x.status === "fail");
+	const reached = onTailnet ? "A device on your tailnet can reach and stream from this connector (checked from inside the tailnet)." : "An assistant can reach and stream from this connector.";
 	if (options.json) {
 		printReport({
 			ok: !failed,
 			state: failed ? "problem" : "on",
 			...(failed ? { code: failed.name } : {}),
-			message: failed ? `${failed.name}: ${failed.detail}` : "An assistant can reach and stream from this connector.",
+			message: failed ? `${failed.name}: ${failed.detail}` : reached,
 			publicUrl: config.publicUrl,
 			connectorUrl: `${config.publicUrl}/mcp`,
 			checks,
 		});
 	} else {
-		console.log(`Testing ${config.publicUrl}/mcp from outside, the way an assistant reaches it:`);
+		console.log(onTailnet ? `Testing ${config.publicUrl}/mcp from inside your tailnet (this computer's resolver), the way your tailnet devices reach it:` : `Testing ${config.publicUrl}/mcp from outside, the way an assistant reaches it:`);
 		for (const line of proofLines(checks)) console.log(line);
-		console.log(failed ? `\n${sym.fail} ${failed.name} failed.` : `\n${sym.ok} An assistant can reach and stream from this connector.`);
+		console.log(failed ? `\n${sym.fail} ${failed.name} failed.` : `\n${sym.ok} ${reached}`);
 	}
 	return failed ? EXIT_FAILED : EXIT_ON;
 }
@@ -1314,7 +1384,7 @@ export const tailscaleMissing = (platform: NodeJS.Platform = process.platform, e
 	`Tailscale wasn't found (not on PATH, and not at ${platform === "win32" ? windowsInstallPaths("tailscale", env).join(" or ") : tailscaleAppPath()})`;
 
 /** Close Funnel on 8443. A failure that leaves the entry in place is a failure; an entry already gone counts as off. */
-function funnelOff(bin: string | undefined): { ok: boolean; message: string } {
+export function funnelOff(bin: string | undefined): { ok: boolean; message: string } {
 	// Bounded like opening it: a call that never ends is a failure that leaves Funnel as it was.
 	const r = bin ? run(bin, ["funnel", `--https=${FUNNEL_PORT}`, "off"], 30_000) : { code: 1, out: tailscaleMissing() };
 	if (r.code === 0) return { ok: true, message: `Tailscale Funnel on port ${FUNNEL_PORT} is off.` };
@@ -1326,6 +1396,21 @@ function funnelOff(bin: string | undefined): { ok: boolean; message: string } {
 }
 
 
+/** Take down this route's mounts on 443 where they still point at serve's port. Every other handler on 443 stays, and is named when it sits on one of the route's paths. */
+export function tailnetOff(bin: string | undefined, config: RemoteConfig): { ok: boolean; message: string; removed: string[] } {
+	if (!bin) return { ok: false, removed: [], message: `${tailscaleMissing()}, so the tailnet paths can't be taken down. The service and remote.json are kept; run ${COMMAND_NAME} remote off again once Tailscale is back.` };
+	const state = readServeState(bin);
+	if (!state) return { ok: false, removed: [], message: `Couldn't read tailscale status or serve status, so nothing was changed. Start Tailscale and run ${COMMAND_NAME} remote off again.` };
+	const handlers = handlersOn443(state);
+	const ours = wantedMounts(config.port).filter((m) => handlers[m.path]?.Proxy === m.target);
+	const r = removeMounts(bin, ours);
+	if (!r.ok) return { ok: false, removed: r.removed, message: `tailscale serve couldn't take down ${r.message}. The service and remote.json are kept; run ${COMMAND_NAME} remote off again.` };
+	const oursPaths = new Set(ours.map((m) => m.path));
+	const left = TYCHICUS_PATHS.filter((path) => handlers[path] && !oursPaths.has(path));
+	const leftNote = left.length ? ` ${left.join(", ")} ${left.length === 1 ? "points" : "point"} somewhere else, so ${left.length === 1 ? "it was" : "they were"} left on.` : "";
+	return { ok: true, removed: r.removed, message: `${r.removed.length ? `Took down the tailnet route's ${r.removed.length} paths on port 443.` : "Nothing of Tychicus's was mounted on port 443."}${leftNote}` };
+}
+
 /**
  * Funnel first, then the service, then the files: while Funnel is open, a serve with OAuth on loopback is the safe state.
  * `json`: one object on stdout, `{ok, message, notes}`, and nothing else; the exit code is the same either way.
@@ -1333,6 +1418,7 @@ function funnelOff(bin: string | undefined): { ok: boolean; message: string } {
 export async function remoteOff(options: { json?: boolean } = {}): Promise<number> {
 	const notes: string[] = [];
 	let failure: string | undefined;
+	let failureCode: string | undefined;
 	/** A line of the report: printed in text mode, kept for the JSON one. */
 	const note = (mark: string, text: string, dim = false) => {
 		if (options.json) notes.push(text);
@@ -1343,9 +1429,16 @@ export async function remoteOff(options: { json?: boolean } = {}): Promise<numbe
 		if (!options.json) console.error(`${sym.fail} ${text}`);
 	};
 	const finish = (code: number): number => {
-		if (options.json) printReport({ ok: code === 0, message: failure ?? "Remote access is off.", notes });
+		if (options.json) printReport({ ok: code === 0, ...(failureCode ? { code: failureCode } : {}), message: failure ?? "Remote access is off.", notes });
 		return code;
 	};
+	// Another setup's services (another config folder under the same HOME) are never stopped from here.
+	const foreign = serviceOfOtherConfig([SERVE_SERVICE, CLOUDFLARE_SERVICE]);
+	if (foreign) {
+		failureCode = foreign.code;
+		problem(foreign.message);
+		return finish(1);
+	}
 	let config: RemoteConfig | undefined;
 	let badFile: string | undefined;
 	try {
@@ -1355,6 +1448,13 @@ export async function remoteOff(options: { json?: boolean } = {}): Promise<numbe
 	}
 	if (badFile !== undefined) note(sym.warn, badFile);
 	let code = 0;
+	// Local Studio's route record, read only: off never changes it, and a malformed one doesn't stop teardown.
+	let record: RouteRecord | undefined;
+	try {
+		record = readRouteRecord();
+	} catch {
+		record = undefined;
+	}
 	// By the service, not remote.json: a damaged or missing file must not leave a tunnel running.
 	const tunnelService = serviceFile(CLOUDFLARE_SERVICE);
 	if (config?.route === "cloudflare" || (tunnelService && existsSync(tunnelService))) {
@@ -1368,6 +1468,14 @@ export async function remoteOff(options: { json?: boolean } = {}): Promise<numbe
 	}
 	if (config?.route === "cloudflare") {
 		// The tunnel is closed above; there's no Funnel to look for on this route.
+	} else if (config?.route === "tailnet") {
+		// The mounts first, like Funnel: while they are up, serve with OAuth on loopback is the safe state.
+		const r = tailnetOff(tailscaleBinary(), config);
+		if (!r.ok) {
+			problem(r.message);
+			return finish(1);
+		}
+		note(sym.ok, r.message);
 	} else if (config?.route === "funnel") {
 		const r = funnelOff(tailscaleBinary());
 		if (!r.ok) {
@@ -1407,7 +1515,9 @@ export async function remoteOff(options: { json?: boolean } = {}): Promise<numbe
 	} else {
 		note(sym.dot, "No remote.json; nothing else to remove.");
 	}
-	if (config?.route === "custom") note(sym.warn, `Your own front door for ${config.publicUrl} still forwards to this machine. Stop it there (for example, stop cloudflared); ${COMMAND_NAME} remote off can't.`);
+	const joined = record !== undefined && config?.route === "custom" && config.publicUrl === `https://${record.hostname}`;
+	if (joined) note(sym.dot, `Local Studio's ${record?.route} route for ${record?.hostname} keeps running; its /mcp paths reach nothing here now. local-studio tunnel off stops it.`);
+	if (config?.route === "custom" && !joined) note(sym.warn, `Your own front door for ${config.publicUrl} still forwards to this machine. Stop it there (for example, stop cloudflared); ${COMMAND_NAME} remote off can't.`);
 	note("", `Approved connectors keep their grants in oauth.json. ${COMMAND_NAME} token clients lists them; ${COMMAND_NAME} token revoke <client id> ends one.`, true);
 	return finish(code);
 }

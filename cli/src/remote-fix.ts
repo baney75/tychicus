@@ -10,6 +10,7 @@ import { CLOUDFLARE_SERVICE, cloudflareConfigFile, cloudflaredBinary } from "./c
 import { CLOUDFLARED_VERSION, cloudflaredAsset, downloadCloudflared, downloadedCloudflared } from "./cloudflared-download.ts";
 import { envVar } from "./env.ts";
 import { passcodeSet } from "./oauth.ts";
+import { reachedOnTailnet } from "./remote-config.ts";
 import { askYes, closeInput, interactiveTerminal } from "./remote-guide.ts";
 import { FUNNEL_PORT, lingerWarning, loadRemoteConfig, openFunnel, operatorWarning, probeLocal, proofLines, type RemoteConfig, saveRemoteConfig, serveWaitMs, tailscaleReady, waitForServe } from "./remote-setup.ts";
 import { CLOUDFLARED_DOWNLOAD_URL, EXIT_FAILED, EXIT_NEEDS_PERSON, EXIT_ON, printReport, type RemoteState, TAILSCALE_OPERATOR_FIX } from "./remote-state.ts";
@@ -17,7 +18,7 @@ import { type ProofCheck, publicChecks } from "./remote-test.ts";
 import { releaseRoot } from "./paths.ts";
 import { COMMAND_NAME } from "./self.ts";
 import { currentRelease, staleServices } from "./service-version.ts";
-import { installService, SERVE_SERVICE, type ServiceSpec, serviceFile, serviceLogHint, serviceRunning, sleep } from "./service.ts";
+import { installService, SERVE_SERVICE, type ServiceSpec, serviceFile, serviceLogHint, serviceOfOtherConfig, serviceRunning, sleep } from "./service.ts";
 import { c, sym } from "./ui.ts";
 
 /** The repairs, in the order they run: a rename first (serve must restart for the new name), serve before Funnel (setup's rule). */
@@ -196,6 +197,12 @@ export async function remoteFix(options: FixOptions): Promise<number> {
 		else console.error(`${sym.fail} ${message}`);
 		return EXIT_NEEDS_PERSON;
 	}
+	const foreign = serviceOfOtherConfig([SERVE_SERVICE, CLOUDFLARE_SERVICE]);
+	if (foreign) {
+		if (options.json) printReport({ ok: false, state: "problem", code: foreign.code, message: foreign.message, actions: [], advice: [] });
+		else console.error(`${sym.fail} ${foreign.message}`);
+		return EXIT_FAILED;
+	}
 
 	const done: FixAction[] = [];
 	let renamed: { oldUrl: string; newUrl: string } | undefined;
@@ -282,13 +289,15 @@ export async function remoteFix(options: FixOptions): Promise<number> {
 
 	// Nothing left to repair here: the outside proof says whether an assistant can reach it.
 	const now = loadRemoteConfig() ?? config;
-	say(done.length ? "\nChecking from outside, the way an assistant reaches it:" : "Nothing to repair on this computer. Checking from outside, the way an assistant reaches it:");
-	const checks = await publicChecks(now.publicUrl);
+	const tailnet = reachedOnTailnet(now);
+	const how = tailnet ? "Checking from inside your tailnet, the way your tailnet devices reach it:" : "Checking from outside, the way an assistant reaches it:";
+	say(done.length ? `\n${how}` : `Nothing to repair on this computer. ${how}`);
+	const checks = await publicChecks(now.publicUrl, { tailnet });
 	for (const line of proofLines(checks)) say(line);
 	const failed = checks.find((x) => x.status === "fail");
 	if (!failed) {
 		const moved = renamed ? ` The connector is now ${renamed.newUrl}/mcp: add the new URL in each assistant; the old one no longer works.` : "";
-		return finish({ ok: true, state: "on", message: `An assistant can reach and stream from this connector.${moved}`, checks }, EXIT_ON);
+		return finish({ ok: true, state: "on", message: `${tailnet ? "A device on your tailnet" : "An assistant"} can reach and stream from this connector.${moved}`, checks }, EXIT_ON);
 	}
 	const hint = fixHint(failed);
 	return finish({ ok: false, state: "problem", code: failed.name, message: `${failed.name}: ${failed.detail}. ${hint}`, checks }, EXIT_FAILED);

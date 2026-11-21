@@ -174,6 +174,70 @@ downloads its own (pinned release 2026.10.7, SHA-256 checked before anything is 
 choosing Cloudflare turns Funnel off only after the tunnel is ready; in a terminal that is
 `remote setup --cloudflare <name> --replace-funnel`.
 
+## Tailnet only
+
+`tychicus remote setup --tailnet` serves the connector to your own tailnet devices and nobody else: `tailscale serve` on
+https port 443, never Funnel. The address is `https://<computer>.<tailnet>.ts.net/mcp`. Each of Tychicus's nine paths
+(`/mcp`, `/authorize`, `/token`, `/register`, `/revoke` and the four `/.well-known/oauth-*` documents) is its own mount, so
+anything else this computer serves on 443 is left alone. Setup refuses, changing nothing, when Funnel is on for 443, when 443
+forwards raw TCP, or when one of the nine paths already goes somewhere else. `remote off` removes exactly those nine
+mounts. claude.ai, ChatGPT and grok.com reach the internet, not your tailnet, so this route is for assistants that run on
+your own devices. `remote test` checks it from inside the tailnet.
+
+What Tailscale does with a mount (checked on tailscale 1.104.5):
+
+- `--set-path=/mcp http://127.0.0.1:<port>/mcp` matches `/mcp` and anything below it at a `/` boundary (`/mcp/x`), never
+  `/mcpx`. It strips the mount path and appends the rest to the target's path, so with the target ending in the same
+  path, the request path and query arrive unchanged.
+- A path nothing is mounted on answers 404.
+- The Host header arrives as the machine's DNS name with no port, which serve accepts. Tailscale adds
+  X-Forwarded-Host, X-Forwarded-Proto `https`, X-Forwarded-For (the caller's tailnet address) and its identity headers.
+- Removing the last mount leaves `tailscale serve status --json` at `{}`. Removing a mount that isn't there exits 1 with
+  "handler does not exist".
+
+Tychicus's own Cloudflare route uses the same nine paths: its cloudflared ingress sends only those paths to serve and
+answers 404 for everything else. `remote cloudflare run` renders that ingress again before each start and keeps the
+tunnel, credentials-file and log lines as they are.
+
+## One tunnel with Local Studio
+
+On a computer with Local Studio, Local Studio owns the one tunnel, on every route (hosted, Cloudflare or tailnet), and
+Tychicus joins it. The design is in Local Studio's `docs/tunnel.md` (baney75/local-studio). Local Studio writes the route
+record, `$LOCAL_STUDIO_DATA_DIR/tunnel/route.json` (else `~/.local-studio/tunnel/route.json`):
+
+```json
+{ "v": 1, "owner": "local-studio", "route": "cloudflare", "hostname": "studio.example.com",
+  "aliases": ["old.example.com"], "ports": { "mcp": 8787, "serve": 18094 } }
+```
+
+Tychicus only reads it and never creates Local Studio's folder. The route carries eleven exact paths: Tychicus's nine on
+`ports.mcp` and Local Studio's `/v1/health` and `/v1/ws`.
+
+- `tychicus remote join [--json] [--no-service]` reads the record. It stops and removes Tychicus's own tunnel service,
+  Funnel or tailnet mounts, but never deletes the Cloudflare tunnel, its credentials file or its DNS record, and it keeps
+  `cloudflared.yml` so Local Studio can adopt the tunnel. It saves `remote.json` with route `custom`, the address
+  `https://<hostname>` and the record's `aliases`, moves serve to `ports.mcp`, and proves the address and each alias.
+  If any proof fails, it puts `remote.json`, serve and its own route back as they were and exits non-zero.
+- `tychicus remote setup` with a route record joins it. Without a record, `--cloudflare <name>` or `--tailnet` runs
+  `local-studio tunnel setup` with that route and `--json` when `local-studio` is on PATH, then joins. A Local Studio
+  folder alone proves nothing (`install --local-studio` makes one). Funnel, no route, `--public-url`, and a re-run on
+  this install's own Funnel or Cloudflare route stay Tychicus's own setup; `remote join` moves that route.
+- Tunnel setup in Local Studio is on its dev channel only. When `local-studio tunnel setup` answers `state: "waitlist"`
+  (with `url`, `next` and `channel`), Tychicus says so, gives the waitlist address, and sets up its own route; `--json`
+  puts the whole answer in `localStudio`. A `local-studio` that answers no JSON (a build from before tunnel setup) also
+  leaves Tychicus its own route. One that answers JSON and fails is a refusal with code `local_studio`.
+- Setup through Local Studio makes the passcode and connect code the way its own setup does: a passcode unless
+  `--no-passcode`, a connect code for `--connect-code` or a person at a terminal, and code `connect_code` when one asked
+  for can't be made. `remote test` and `remote fix` check a joined tailnet route from inside the tailnet.
+- An alias is an older address the same route still answers, such as the name a Tychicus Cloudflare route used before
+  Local Studio adopted it. Serve answers OAuth on each alias as its own address: discovery, issuer, resource and the
+  WWW-Authenticate challenge use the host the request came in on, and a token works only on the host that issued it.
+- `remote status --json` adds `localStudio` (`{route, hostname, aliases, mcpPort, joined}`, or null) and, for
+  Tychicus's own Cloudflare route, `cloudflare` (`{tunnelId, credentialsFile, configFile}`, paths only, never the
+  credentials). `remote off` on a joined computer leaves Local Studio's route running and says so.
+
+Without Local Studio, nothing changes: Tychicus keeps its own route with the same exact paths.
+
 ## From the side panel
 
 Settings > Agents > "Use Tychicus from Claude, ChatGPT and Grok" turns it on without a terminal, on Mac, Linux and
@@ -246,6 +310,12 @@ what you can, so tick this only for an assistant you'd let sit at your keyboard.
 sentences. `state` is one of `tailscale_missing`, `tailscale_signed_out`, `funnel_not_allowed` (with
 `adminUrl`, the page Tailscale printed), `funnel_closed` (status only), `cloudflared_missing`, `tailnet_lock`, `port_busy`, `ready`, `on` (with
 `connectorUrl`), `no_browser_connected` or `problem` (with `message`, and sometimes `code`).
+`setup --json` and `join --json` also give `step`, the agent's next move: `ready` (on), `joined` (on through Local
+Studio's route), `needs_signin` (Tailscale or Cloudflare sign-in), `needs_dns` (a name or DNS problem) or
+`error` (with `code`). With stdin not a terminal they never prompt, so an agent can run setup for someone.
+`remote off`, `setup`, `fix` and `join` refuse, with code `service_belongs_to_other_config` and exit 1, when the
+installed serve or tunnel service names another config folder than this shell's (a run with TYCHICUS_CONFIG_DIR set
+under the same HOME as the person's own install). They change nothing, and the message names both folders.
 `status --json` also has `routes`: `tailscale` and `cloudflare`, each with `installed` and `signedIn`, read without changing anything.
 `setup --json` includes `passcode` only in the run that made it, even when that run then fails, so
 keep it. `token passcode --json` makes a new one. It mints no connect code unless you pass `--connect-code`; then it adds
