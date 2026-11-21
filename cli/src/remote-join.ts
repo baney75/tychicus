@@ -6,31 +6,27 @@
  *   onto `ports.mcp`, take down any tunnel of Tychicus's own (its Cloudflare service, Funnel or tailnet mounts) without deleting the
  *   Cloudflare tunnel, its credentials or its DNS, which Local Studio adopts, then prove the address from outside. Any failure puts
  *   remote.json, serve and Tychicus's own tunnel back as they were and exits non-zero.
- * - `remote setup` on a machine with Local Studio: with a record it joins; without one it runs `local-studio tunnel setup` with the
- *   route asked for, then joins. Tychicus starts no tunnel of its own there. Local Studio's tunnel setup is dev-channel only: a
- *   stable or nightly build answers `{"state": "waitlist", "message": ...}`, which is passed through unchanged as the result.
+ * - `remote setup`: with a record it joins. Without one, for --cloudflare or --tailnet where `local-studio` is on PATH and this
+ *   install has no Funnel or Cloudflare route of its own, it runs `local-studio tunnel setup` with that route, then joins. Local
+ *   Studio's tunnel setup is dev-channel only: a stable or nightly build answers `{"state": "waitlist", "url", "next", "channel"}`,
+ *   and a build from before it doesn't know the command. Either way Tychicus says so and sets up its own route instead.
  */
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { CLOUDFLARE_SERVICE, cloudflareConfigFile, topLevelValue } from "./cloudflare.ts";
 import { launcherBinary, launcherValid, which } from "./harness.ts";
 import { hubFile } from "./hub-state.ts";
-import { passcodeSet } from "./oauth.ts";
+import { mintApprovalCode, passcodeSet, setPasscode } from "./oauth.ts";
 import { loadRemoteConfig, type RemoteConfig, remoteFile, saveRemoteConfig } from "./remote-config.ts";
 import { funnelOff, openFunnel, proofLines, type SetupOptions, serveWaitMs, tailnetOff, waitForServe } from "./remote-setup.ts";
-import { agentStep, EXIT_NEEDS_PERSON, printReport, type SetupReport, setupExitCode } from "./remote-state.ts";
+import { agentStep, printReport, type SetupReport, setupExitCode } from "./remote-state.ts";
 import { type ProofCheck, preloadedHooks, publicChecks } from "./remote-test.ts";
-import { localStudioDataDir, type RouteRecord, readRouteRecord, routeRecordFile } from "./route-record.ts";
+import { type RouteRecord, readRouteRecord, routeRecordFile } from "./route-record.ts";
 import { COMMAND_NAME } from "./self.ts";
 import { installService, removeService, SERVE_SERVICE, serviceFile, serviceLogHint, serviceOfOtherConfig, writeAtomic } from "./service.ts";
 import { applyMounts, planMounts, readServeState, wantedMounts } from "./tailnet.ts";
 import { tailscaleBinary } from "./tailscale.ts";
 import { c, sym } from "./ui.ts";
-
-/** Is Local Studio on this machine? Its command on PATH, or its data folder ($LOCAL_STUDIO_DATA_DIR or ~/.local-studio). */
-export function localStudioPresent(): boolean {
-	return which("local-studio") !== undefined || existsSync(localStudioDataDir());
-}
 
 /**
  * For Local Studio's adopt step (`remote status --json`): where Tychicus's own Cloudflare tunnel is, by path only. Undefined when
@@ -56,6 +52,12 @@ export interface JoinOptions {
 	service?: boolean;
 	/** Setup's --port: must be the record's ports.mcp. */
 	port?: number;
+	/** From setup (SetupOptions): true mints a passcode when none is set, false (--no-passcode) doesn't. `remote join` mints none. */
+	passcode?: boolean;
+	/** From setup: mint a connect code after the proof, and fail with connect_code when it can't be made. */
+	connectCode?: boolean;
+	/** From setup: a person at a terminal, who gets a connect code unasked outside JSON mode. */
+	terminal?: boolean;
 }
 
 function reporter(options: { json?: boolean; report?: (report: SetupReport) => void }) {
@@ -74,14 +76,7 @@ function reporter(options: { json?: boolean; report?: (report: SetupReport) => v
 		return setupExitCode(report);
 	};
 	const fail = (message: string, code: string, checks?: ProofCheck[]) => finish({ ok: false, state: "problem", message, code, passcodeSet: passcodeSet() }, checks);
-	/** Local Studio's waitlist answer, passed through unchanged: its message, and its whole report under localStudio. Exit 3: it waits on someone. */
-	const waitlist = (answer: Record<string, unknown>): number => {
-		const message = typeof answer.message === "string" ? answer.message : "Local Studio's tunnel is waitlist only on this build.";
-		if (json) emit({ ok: false, state: "waitlist", step: "waitlist", message, passcodeSet: passcodeSet(), localStudio: answer });
-		else console.error(`${sym.warn} ${message}`);
-		return EXIT_NEEDS_PERSON;
-	};
-	return { json, say, finish, fail, waitlist };
+	return { json, say, finish, fail };
 }
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -93,7 +88,7 @@ async function prove(url: string, tailnet: boolean): Promise<ProofCheck[]> {
 }
 
 export async function remoteJoin(options: JoinOptions = {}): Promise<number> {
-	const { say, finish, fail } = reporter(options);
+	const { json, say, finish, fail } = reporter(options);
 	if (existsSync(hubFile())) return fail(`This install is set up as a hub (${hubFile()}), and an install has one public route. Run ${COMMAND_NAME} hub off first. Nothing was changed.`, "hub");
 	const foreign = serviceOfOtherConfig([SERVE_SERVICE, CLOUDFLARE_SERVICE]);
 	if (foreign) return fail(foreign.message, foreign.code);
@@ -145,7 +140,8 @@ export async function remoteJoin(options: JoinOptions = {}): Promise<number> {
 	let touchedServe = false;
 	let removedCloudflare = false;
 	let closedFunnel = false;
-	let removedTailnet = false;
+	/** The tailnet mounts this run took down, even when taking down the rest failed. */
+	let removedMounts: string[] = [];
 	const rollback = async (why: string, code: string, checks?: ProofCheck[]): Promise<number> => {
 		const failed: string[] = [];
 		if (wroteConfig) {
@@ -159,9 +155,9 @@ export async function remoteJoin(options: JoinOptions = {}): Promise<number> {
 		if (touchedServe && !(serveInstalled ? (await installService()).ok : removeService(SERVE_SERVICE).ok)) failed.push("the serve service");
 		if (removedCloudflare && !(await installService(CLOUDFLARE_SERVICE)).ok) failed.push("the Cloudflare tunnel's service");
 		if (closedFunnel && ownFunnel && tsBin && (await openFunnel(tsBin, funnelDns, ownFunnel.port)).kind !== "opened") failed.push("Funnel");
-		if (removedTailnet && ownTailnet && tsBin) {
+		if (removedMounts.length && ownTailnet && tsBin) {
 			const state = readServeState(tsBin);
-			const wanted = wantedMounts(ownTailnet.port);
+			const wanted = wantedMounts(ownTailnet.port).filter((m) => removedMounts.includes(m.path));
 			const plan = state ? planMounts(state, wanted) : undefined;
 			if (!plan?.ok || !applyMounts(tsBin, plan, wanted).ok) failed.push("the tailnet mounts");
 		}
@@ -207,7 +203,7 @@ export async function remoteJoin(options: JoinOptions = {}): Promise<number> {
 	if (sharedMounts) say(`${sym.dot} The tailnet mounts on ${record.hostname} send the same paths to the same port, so they stay as Local Studio's route.`);
 	if (ownTailnet) {
 		const r = tailnetOff(tsBin, ownTailnet);
-		removedTailnet = r.ok;
+		removedMounts = r.removed;
 		if (!r.ok) return rollback(r.message, "tailnet");
 		say(`${sym.ok} ${r.message}`);
 	}
@@ -221,12 +217,32 @@ export async function remoteJoin(options: JoinOptions = {}): Promise<number> {
 		const failed = checks.find((check) => check.status === "fail");
 		if (failed) return rollback(`${url}/mcp doesn't work through Local Studio's ${record.route} route: ${failed.name} failed (${failed.detail}).`, failed.name, all);
 	}
+	// The way in, by setup's rules (runSetup): a passcode unless --no-passcode, and a connect code when asked or for a person at a terminal.
+	const connectorUrl = `${publicUrl}/mcp`;
+	const madePasscode = options.passcode === true && !passcodeSet() ? setPasscode() : undefined;
+	if (madePasscode) say(`${sym.ok} Passcode, shown once (it re-approves an assistant you already approved):\n\n  ${madePasscode}\n`);
+	let connect: { code: string; expiresAt: number } | undefined;
+	let connectProblem = "";
+	if (options.connectCode || (!json && options.terminal)) {
+		try {
+			connect = mintApprovalCode();
+		} catch (err) {
+			connectProblem = errorText(err);
+		}
+	}
+	const way = { connectorUrl, ...(madePasscode ? { passcode: madePasscode } : {}), passcodeSet: passcodeSet() };
+	if (options.connectCode && !connect) {
+		const why = `Joined Local Studio's ${record.route} route at ${connectorUrl}, but the connect code couldn't be made (${connectProblem}). remote.json is kept. Make one with ${COMMAND_NAME} token approval-code.`;
+		return finish({ ok: false, state: "problem", code: "connect_code", message: why, ...way, connectCodeProblem: connectProblem }, all, true);
+	}
+	if (connect) say(`${sym.ok} Connect code: ${connect.code}. Type it on the approval page when you add Tychicus to an assistant; it works once, for 10 minutes.`);
 	return finish({
 		ok: true,
 		state: "on",
-		message: `Joined Local Studio's ${record.route} route: ${publicUrl}/mcp reaches serve on 127.0.0.1:${port}${aliases.length ? `, and so ${aliases.length === 1 ? "does" : "do"} ${aliases.map((a) => `https://${a}/mcp`).join(", ")} while connectors move` : ""}. No tunnel of Tychicus's own runs now.`,
-		connectorUrl: `${publicUrl}/mcp`,
-		passcodeSet: passcodeSet(),
+		message: `Joined Local Studio's ${record.route} route: ${connectorUrl} reaches serve on 127.0.0.1:${port}${aliases.length ? `, and so ${aliases.length === 1 ? "does" : "do"} ${aliases.map((a) => `https://${a}/mcp`).join(", ")} while connectors move` : ""}. No tunnel of Tychicus's own runs now.`,
+		...way,
+		...(connect ? { connectCode: connect.code, connectCodeExpiresAt: connect.expiresAt } : {}),
+		next: { kind: "add_connector", url: connectorUrl },
 	}, all, true);
 }
 
@@ -257,12 +273,32 @@ function runLocalStudio(bin: string, args: string[], quiet: boolean): Promise<{ 
 	});
 }
 
+/** What `remote setup` does when Local Studio doesn't run this machine's tunnel: Tychicus's own route, and Local Studio's answer, if any. */
+export type Standalone = { standalone: true; localStudio?: Record<string, unknown> };
+
 /**
- * `remote setup` on a machine with Local Studio: Local Studio runs the tunnel. With a route record, join it. Without one, run
- * `local-studio tunnel setup --cloudflare <name>` or `--tailnet`, then join. Funnel and setup without a route aren't Local Studio's.
+ * `remote setup` where Local Studio runs the tunnel: with a route record, join it. Without one, run `local-studio tunnel setup
+ * --cloudflare <name>` or `--tailnet`, then join. Local Studio runs the tunnel only when it says so: a record, or a tunnel setup
+ * that answers with something other than its waitlist. A folder of Local Studio's alone proves nothing (`install --local-studio`
+ * makes one), Funnel and setup without a route aren't Local Studio's, and a re-run on Tychicus's own Funnel or Cloudflare route
+ * stays Tychicus's (`remote join` moves it). Then the answer is Standalone, and setup runs Tychicus's own route.
  */
-export async function setupThroughLocalStudio(options: SetupOptions): Promise<number> {
-	const { json, say, fail, waitlist } = reporter(options);
+export async function setupThroughLocalStudio(options: SetupOptions): Promise<number | Standalone> {
+	const { json, say, fail } = reporter(options);
+	const standalone: Standalone = { standalone: true };
+	const recorded = existsSync(routeRecordFile());
+	const args = options.cloudflare ? ["tunnel", "setup", "--cloudflare", options.cloudflare] : options.tailnet ? ["tunnel", "setup", "--tailnet"] : undefined;
+	const bin = which("local-studio");
+	if (!recorded) {
+		if (!args || !bin) return standalone;
+		let own: RemoteConfig | undefined;
+		try {
+			own = loadRemoteConfig();
+		} catch {
+			return standalone;
+		}
+		if (own?.route === "funnel" || own?.route === "cloudflare") return standalone;
+	}
 	const foreign = serviceOfOtherConfig([SERVE_SERVICE, CLOUDFLARE_SERVICE]);
 	if (foreign) return fail(foreign.message, foreign.code);
 	let record: RouteRecord | undefined;
@@ -274,27 +310,25 @@ export async function setupThroughLocalStudio(options: SetupOptions): Promise<nu
 	if (record) {
 		const asked = options.cloudflare !== undefined ? "cloudflare" : options.tailnet ? "tailnet" : options.tailscale ? "funnel" : undefined;
 		if (asked && asked !== record.route) say(`${sym.dot} Local Studio already runs a ${record.route} route for ${record.hostname}; a machine has one tunnel, so ${COMMAND_NAME} joins that one.`);
-	} else {
-		const args = options.cloudflare ? ["tunnel", "setup", "--cloudflare", options.cloudflare] : options.tailnet ? ["tunnel", "setup", "--tailnet"] : undefined;
-		if (!args) {
-			return fail(
-				`Local Studio is on this machine (${localStudioDataDir()}) and runs its one tunnel, so ${COMMAND_NAME} joins that tunnel instead of starting its own${options.tailscale ? ", and Local Studio doesn't use Funnel" : ""}. Run ${COMMAND_NAME} remote setup --cloudflare <name> (a name on your Cloudflare domain) or --tailnet (your tailnet only). Nothing was changed.`,
-				"local_studio",
-			);
-		}
-		const bin = which("local-studio");
-		if (!bin) {
-			return fail(`Local Studio is on this machine (${localStudioDataDir()}), but its local-studio command isn't on PATH, so its tunnel can't be set up from here. Update Local Studio, then run this again. Nothing was changed.`, "local_studio");
-		}
+	} else if (args && bin) {
 		say(`${sym.dot} Local Studio runs this machine's tunnel. Running: local-studio ${args.join(" ")}`);
 		const r = await runLocalStudio(bin, args, json);
-		// Stable and nightly Local Studio offer the tunnel by waitlist only: that answer is the result, never a reason to start Tychicus's own.
-		if (r.answer?.state === "waitlist") return waitlist(r.answer);
+		// Stable and nightly Local Studio offer the tunnel by waitlist only: Tychicus's own route instead, and the person learns where to sign up.
+		if (r.answer?.state === "waitlist") {
+			const a = r.answer;
+			const next = a.next && typeof a.next === "object" ? (a.next as Record<string, unknown>) : {};
+			const url = typeof a.url === "string" ? a.url : typeof next.url === "string" ? next.url : undefined;
+			const channel = typeof a.channel === "string" ? `the ${a.channel} channel` : "this build";
+			if (!json) console.log(`${sym.warn} Local Studio's tunnel is on its dev channel only, and this Local Studio is on ${channel}.${url ? ` Join the waitlist: ${url}` : ""}\n  ${COMMAND_NAME} sets up its own route instead.`);
+			return { standalone: true, localStudio: a };
+		}
+		// A Local Studio from before tunnel setup doesn't know the command and answers no JSON: it runs no tunnel, so Tychicus does.
+		if (r.code !== 0 && !r.answer) {
+			say(`${sym.warn} This Local Studio has no tunnel setup (${r.out.slice(-200) || `exit ${r.code}`}), so ${COMMAND_NAME} sets up its own route. Update Local Studio to share one tunnel.`);
+			return standalone;
+		}
 		if (r.code !== 0) {
-			return fail(
-				`local-studio ${args.join(" ")} failed (exit ${r.code})${r.out ? `: ${r.out.slice(-400)}` : ""}. If it doesn't know the tunnel command, update Local Studio. ${COMMAND_NAME} changed nothing.`,
-				"local_studio",
-			);
+			return fail(`local-studio ${args.join(" ")} failed (exit ${r.code})${r.out ? `: ${r.out.slice(-400)}` : ""}. ${COMMAND_NAME} changed nothing.`, "local_studio");
 		}
 		try {
 			record = readRouteRecord();
@@ -303,5 +337,5 @@ export async function setupThroughLocalStudio(options: SetupOptions): Promise<nu
 		}
 		if (!record) return fail(`local-studio ${args.join(" ")} finished but wrote no route record (${routeRecordFile()}), so there is nothing to join. Update Local Studio. ${COMMAND_NAME} changed nothing.`, "local_studio");
 	}
-	return remoteJoin({ json: options.json, report: options.report, service: options.service, port: options.port });
+	return remoteJoin({ json: options.json, report: options.report, service: options.service, port: options.port, passcode: options.passcode, connectCode: options.connectCode, terminal: options.terminal });
 }

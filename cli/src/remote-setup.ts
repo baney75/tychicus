@@ -65,10 +65,10 @@ import { c, sym } from "./ui.ts";
 import { COMMAND_NAME } from "./self.ts";
 import { envVar } from "./env.ts";
 import { windowsInstallPaths } from "./tool-paths.ts";
-import { loadRemoteConfig, type RemoteConfig, remoteFile, saveRemoteConfig } from "./remote-config.ts";
+import { loadRemoteConfig, type RemoteConfig, reachedOnTailnet, remoteFile, saveRemoteConfig } from "./remote-config.ts";
 import { type RouteRecord, readRouteRecord, routeRecordFile, TYCHICUS_PATHS } from "./route-record.ts";
 import { applyMounts, funnelOn443, handlersOn443, type Mount, mountTarget, planMounts, readServeState, removeMounts, type ServeState, wantedMounts } from "./tailnet.ts";
-import { cloudflareTunnelPaths, localStudioPresent, setupThroughLocalStudio } from "./remote-join.ts";
+import { cloudflareTunnelPaths, setupThroughLocalStudio } from "./remote-join.ts";
 
 /** Funnel's own port: keeps the OAuth paths at the root and anything on 443 private. */
 export const FUNNEL_PORT = 8443;
@@ -593,9 +593,15 @@ async function askCloudflareHost(say: (line: string) => void): Promise<string | 
 
 export async function remoteSetup(options: SetupOptions): Promise<number> {
 	try {
-		// One tunnel per machine (D57): where Local Studio is, it runs the tunnel and Tychicus joins it. --public-url is the person's own front door.
-		if (!options.publicUrl && localStudioPresent()) return await setupThroughLocalStudio(options);
-		return await runSetup(options);
+		// One tunnel per machine (D57): where Local Studio runs the tunnel, Tychicus joins it. --public-url is the person's own front door.
+		if (options.publicUrl) return await runSetup(options);
+		const via = await setupThroughLocalStudio(options);
+		if (typeof via === "number") return via;
+		// Its own route instead; an app also gets Local Studio's waitlist answer, so it can show where to sign up.
+		const answer = via.localStudio;
+		const emit = options.report ?? printReport;
+		const json = options.json === true || options.report !== undefined;
+		return await runSetup(answer && json ? { ...options, report: (report) => emit({ ...report, localStudio: answer }) } : options);
 	} finally {
 		closeInput();
 	}
@@ -1349,7 +1355,7 @@ export async function remoteTest(options: { json: boolean }): Promise<number> {
 		else console.error(`${sym.fail} ${message}`);
 		return EXIT_NEEDS_PERSON;
 	}
-	const onTailnet = config.route === "tailnet";
+	const onTailnet = reachedOnTailnet(config);
 	const checks = frontDoorNext(await publicChecks(config.publicUrl, { tailnet: onTailnet }), config);
 	const failed = checks.find((x) => x.status === "fail");
 	const reached = onTailnet ? "A device on your tailnet can reach and stream from this connector (checked from inside the tailnet)." : "An assistant can reach and stream from this connector.";
@@ -1391,18 +1397,18 @@ export function funnelOff(bin: string | undefined): { ok: boolean; message: stri
 
 
 /** Take down this route's mounts on 443 where they still point at serve's port. Every other handler on 443 stays, and is named when it sits on one of the route's paths. */
-export function tailnetOff(bin: string | undefined, config: RemoteConfig): { ok: boolean; message: string } {
-	if (!bin) return { ok: false, message: `${tailscaleMissing()}, so the tailnet paths can't be taken down. The service and remote.json are kept; run ${COMMAND_NAME} remote off again once Tailscale is back.` };
+export function tailnetOff(bin: string | undefined, config: RemoteConfig): { ok: boolean; message: string; removed: string[] } {
+	if (!bin) return { ok: false, removed: [], message: `${tailscaleMissing()}, so the tailnet paths can't be taken down. The service and remote.json are kept; run ${COMMAND_NAME} remote off again once Tailscale is back.` };
 	const state = readServeState(bin);
-	if (!state) return { ok: false, message: `Couldn't read tailscale status or serve status, so nothing was changed. Start Tailscale and run ${COMMAND_NAME} remote off again.` };
+	if (!state) return { ok: false, removed: [], message: `Couldn't read tailscale status or serve status, so nothing was changed. Start Tailscale and run ${COMMAND_NAME} remote off again.` };
 	const handlers = handlersOn443(state);
 	const ours = wantedMounts(config.port).filter((m) => handlers[m.path]?.Proxy === m.target);
 	const r = removeMounts(bin, ours);
-	if (!r.ok) return { ok: false, message: `tailscale serve couldn't take down ${r.message}. The service and remote.json are kept; run ${COMMAND_NAME} remote off again.` };
+	if (!r.ok) return { ok: false, removed: r.removed, message: `tailscale serve couldn't take down ${r.message}. The service and remote.json are kept; run ${COMMAND_NAME} remote off again.` };
 	const oursPaths = new Set(ours.map((m) => m.path));
 	const left = TYCHICUS_PATHS.filter((path) => handlers[path] && !oursPaths.has(path));
 	const leftNote = left.length ? ` ${left.join(", ")} ${left.length === 1 ? "points" : "point"} somewhere else, so ${left.length === 1 ? "it was" : "they were"} left on.` : "";
-	return { ok: true, message: `${r.removed.length ? `Took down the tailnet route's ${r.removed.length} paths on port 443.` : "Nothing of Tychicus's was mounted on port 443."}${leftNote}` };
+	return { ok: true, removed: r.removed, message: `${r.removed.length ? `Took down the tailnet route's ${r.removed.length} paths on port 443.` : "Nothing of Tychicus's was mounted on port 443."}${leftNote}` };
 }
 
 /**

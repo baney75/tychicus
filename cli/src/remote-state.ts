@@ -102,7 +102,7 @@ export interface SetupReport {
 	state: RemoteState;
 	/** For an agent: what happens next (agentStep). The app reads `state`; this is the same report, said as one step. */
 	step?: AgentStep;
-	/** On waitlist: Local Studio's own report from `local-studio tunnel setup --json`, unchanged. */
+	/** Local Studio's waitlist answer from `local-studio tunnel setup --json`, unchanged, when setup used Tychicus's own route instead. */
 	localStudio?: Record<string, unknown>;
 	message: string;
 	adminUrl?: string;

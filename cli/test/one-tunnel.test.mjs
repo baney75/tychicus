@@ -150,6 +150,7 @@ if (args[0] === "serve") {
 	const path = (args.find((a) => a.startsWith("--set-path=")) || "").slice(11);
 	if (args[args.length - 1] === "off") {
 		const handlers = s.Web?.[key]?.Handlers;
+		if ((opts.failOff || []).includes(path)) { console.error("error: something broke"); process.exit(1); }
 		if (!handlers?.[path]) { console.error("error: failed to remove web serve: handler does not exist"); process.exit(1); }
 		delete handlers[path];
 		if (!Object.keys(handlers).length) { delete s.Web[key]; if (!Object.keys(s.Web).length) delete s.Web; if (s.TCP) { delete s.TCP["443"]; if (!Object.keys(s.TCP).length) delete s.TCP; } }
@@ -499,6 +500,40 @@ test("remote join on the tailnet leaves mounts Local Studio now shares, and remo
 	}
 });
 
+test("remote join puts back every tailnet mount it took down when teardown fails partway", { skip: unixOnly }, async () => {
+	const local = await localServe(`https://${DNS}/mcp`);
+	try {
+		const mounts = (port) => Object.fromEntries(TYCHICUS_PATHS.map((p) => [p, { Proxy: `http://127.0.0.1:${port}${p}` }]));
+		const s = scenario("join-tailnet-half-off", { ts: { failOff: ["/authorize"] }, serveState: { TCP: { 443: { HTTPS: true } }, Web: { [`${DNS}:443`]: { Handlers: mounts(9001) } } } });
+		writeFileSync(join(s.config, "remote.json"), JSON.stringify({ publicUrl: `https://${DNS}`, port: 9001, route: "tailnet" }));
+		const before = s.remoteJsonText();
+		s.writeRecord({ v: 1, owner: "local-studio", route: "tailnet", hostname: DNS, ports: { mcp: local.port } });
+		const r = await s.runAsync(["remote", "join", "--no-service", "--json"], {}, { hooks: true });
+		assert.equal(r.code, 1, r.out);
+		assert.equal(r.json().code, "tailnet");
+		assert.match(r.json().message, /put back as they were/);
+		assert.deepEqual(handlers(s), mounts(9001), "the mounts removed before the failure are back");
+		assert.equal(s.remoteJsonText(), before);
+	} finally {
+		await local.close();
+	}
+});
+
+test("remote test and remote fix check a joined tailnet route from inside the tailnet", { skip: unixOnly }, async () => {
+	const s = scenario("joined-tailnet-checks");
+	const local = await localServe(`https://${DNS}/mcp`);
+	try {
+		writeFileSync(join(s.config, "remote.json"), JSON.stringify({ publicUrl: `https://${DNS}`, port: local.port, route: "custom" }));
+		s.writeRecord({ v: 1, owner: "local-studio", route: "tailnet", hostname: DNS, ports: { mcp: local.port } });
+		const t = (await s.runAsync(["remote", "test", "--json"])).json();
+		assert.match(t.checks.find((x) => x.name === "dns").detail, /checked from inside your tailnet/, JSON.stringify(t.checks));
+		const f = (await s.runAsync(["remote", "fix", "--json", "--yes"])).json();
+		assert.match(f.checks.find((x) => x.name === "dns").detail, /checked from inside your tailnet/, JSON.stringify(f));
+	} finally {
+		await local.close();
+	}
+});
+
 test("remote join refuses without a record, with a record that isn't Local Studio's, or with another --port, and changes nothing", { skip: unixOnly }, async () => {
 	const s = scenario("join-refuse");
 	const none = await s.runAsync(["remote", "join", "--json"]);
@@ -524,19 +559,29 @@ function localStudioStub(s, { record, answer = { ok: true, state: "on", message:
 	s.script("local-studio", `echo "local-studio $*" >> ${join(s.dir, "calls.log")}\n${write}/bin/cat <<'JSON'\n${JSON.stringify(answer)}\nJSON\nexit ${exit}\n`);
 }
 
-test("with Local Studio and no route asked, setup starts no tunnel of its own and says which routes Local Studio runs", { skip: unixOnly }, async () => {
-	const s = scenario("defer-none");
-	mkdirSync(s.studio, { recursive: true });
-	const r = (await s.runAsync(["remote", "setup", "--json", "--no-service"])).json();
-	assert.equal(r.code, "local_studio");
-	assert.match(r.message, /--cloudflare <name>.*or --tailnet/);
-	const funnel = (await s.runAsync(["remote", "setup", "--tailscale", "--json", "--no-service"])).json();
-	assert.match(funnel.message, /Local Studio doesn't use Funnel/);
-	assert.ok(!s.calls().some((x) => x.startsWith("tailscale funnel") || x.startsWith("tailscale serve")), s.calls().join("\n"));
-	const missing = (await s.runAsync(["remote", "setup", "--tailnet", "--json", "--no-service"])).json();
-	assert.equal(missing.code, "local_studio");
-	assert.match(missing.message, /local-studio command isn't on PATH.*Update Local Studio/);
-	assert.equal(s.remoteJson(), undefined);
+test("a Local Studio folder with no record and no tunnel command is no reason to leave Tychicus's own Funnel route", { skip: unixOnly }, async () => {
+	// `tychicus install --local-studio` makes this folder itself, and stable Local Studio has no tunnel setup.
+	const s = scenario("defer-plugins-only");
+	mkdirSync(join(s.studio, "plugins"), { recursive: true });
+	const local = await localServe(`https://${DNS}:8443/mcp`);
+	try {
+		const r = (await s.runAsync(["remote", "setup", "--tailscale", "--json", "--no-service", "--no-passcode", "--port", String(local.port)])).json();
+		assert.notEqual(r.code, "local_studio", r.message);
+		assert.doesNotMatch(r.message, /Local Studio/);
+		assert.ok(s.calls().some((x) => x.startsWith("tailscale funnel")), `${r.message}\n${s.calls().join("\n")}`);
+	} finally {
+		await local.close();
+	}
+});
+
+test("a re-run on Tychicus's own Cloudflare route with no record stays Tychicus's, even with a local-studio that has tunnel setup", { skip: unixOnly }, async () => {
+	const s = scenario("defer-own-route");
+	cloudflareRoute(s, 8787);
+	localStudioStub(s, { record: { v: 1, owner: "local-studio", route: "cloudflare", hostname: STUDIO, ports: { mcp: 8787 } } });
+	const r = (await s.runAsync(["remote", "setup", "--cloudflare", CF_HOST, "--json", "--no-service", "--no-passcode"])).json();
+	assert.notEqual(r.code, "local_studio", r.message);
+	assert.deepEqual(s.calls().filter((x) => x.startsWith("local-studio")), [], "local-studio isn't run");
+	assert.equal(existsSync(s.recordFile), false);
 });
 
 test("with Local Studio, setup --tailnet runs local-studio tunnel setup --tailnet --json, then joins its route", { skip: unixOnly }, async () => {
@@ -550,6 +595,28 @@ test("with Local Studio, setup --tailnet runs local-studio tunnel setup --tailne
 		assert.deepEqual(s.calls().filter((x) => x.startsWith("local-studio")), ["local-studio tunnel setup --tailnet --json"]);
 		assert.deepEqual(mountCalls(s), [], "Tychicus mounts nothing itself");
 		assert.deepEqual(s.remoteJson(), { publicUrl: `https://${DNS}`, port: local.port, route: "custom" });
+	} finally {
+		await local.close();
+	}
+});
+
+test("setup through Local Studio mints the passcode and the connect code the way its own setup does", { skip: unixOnly }, async () => {
+	const s = scenario("defer-connect-code");
+	const local = await localServe(`https://${DNS}/mcp`);
+	try {
+		localStudioStub(s, { record: { v: 1, owner: "local-studio", route: "tailnet", hostname: DNS, ports: { mcp: local.port } } });
+		const r = await s.runAsync(["remote", "setup", "--tailnet", "--no-service", "--connect-code", "--json"], {}, { hooks: true });
+		assert.equal(r.code, 0, r.out);
+		const report = r.json();
+		assert.equal(report.step, "joined");
+		assert.match(report.connectCode ?? "", /^TK-/, r.out);
+		assert.ok(report.connectCodeExpiresAt > Date.now(), r.out);
+		assert.equal(typeof report.passcode, "string", "a passcode is made without --no-passcode");
+		assert.equal(report.passcodeSet, true);
+		assert.deepEqual(report.next, { kind: "add_connector", url: `https://${DNS}/mcp` });
+		const again = (await s.runAsync(["remote", "setup", "--tailnet", "--no-service", "--json"], {}, { hooks: true })).json();
+		assert.equal(again.passcode, undefined, "a passcode is made once");
+		assert.equal(again.connectCode, undefined, "no code unasked in an agent's shell");
 	} finally {
 		await local.close();
 	}
@@ -570,32 +637,51 @@ test("with Local Studio's record already there, setup --cloudflare joins it with
 	}
 });
 
-test("Local Studio's waitlist answer is the result, passed through unchanged, and Tychicus starts no tunnel of its own", { skip: unixOnly }, async () => {
+const WAITLIST = "https://local-studio-waitlist.magnus-b37.workers.dev";
+
+test("on Local Studio's waitlist, setup says the tunnel is dev-channel only, gives the waitlist and sets up Tychicus's own route", { skip: unixOnly }, async () => {
 	const s = scenario("defer-waitlist");
-	const answer = { ok: false, state: "waitlist", message: "The Local Studio tunnel is on the waitlist for this build. Join at local.studio/tunnel.", position: 12 };
+	const answer = { state: "waitlist", next: { kind: "open_page", url: WAITLIST }, url: WAITLIST, channel: "stable" };
 	localStudioStub(s, { answer, exit: 3 });
-	const r = await s.runAsync(["remote", "setup", "--cloudflare", "me.example.com", "--json", "--no-service"]);
-	assert.equal(r.code, 3, r.out);
-	const report = r.json();
-	assert.equal(report.state, "waitlist");
-	assert.equal(report.step, "waitlist");
-	assert.equal(report.message, answer.message);
-	assert.deepEqual(report.localStudio, answer);
-	assert.deepEqual(s.calls().filter((x) => x.startsWith("local-studio")), ["local-studio tunnel setup --cloudflare me.example.com --json"]);
-	assert.deepEqual(s.calls().filter((x) => x.startsWith("cloudflared") || x.startsWith("tailscale")), []);
-	assert.equal(s.remoteJson(), undefined);
-	const text = await s.runAsync(["remote", "setup", "--cloudflare", "me.example.com", "--no-service"]);
-	assert.equal(text.code, 3);
-	assert.ok(text.stderr.includes(answer.message));
+	const local = await localServe(`https://${DNS}/mcp`);
+	try {
+		const args = ["remote", "setup", "--tailnet", "--no-service", "--no-passcode", "--port", String(local.port)];
+		const r = await s.runAsync([...args, "--json"]);
+		const report = r.json();
+		assert.notEqual(report.state, "waitlist", r.out);
+		assert.deepEqual(report.localStudio, answer);
+		assert.deepEqual(s.calls().filter((x) => x.startsWith("local-studio")), ["local-studio tunnel setup --tailnet --json"]);
+		assert.deepEqual(s.remoteJson(), { publicUrl: `https://${DNS}`, port: local.port, route: "tailnet" }, "Tychicus's own tailnet route");
+		assert.equal(Object.keys(handlers(s)).length, TYCHICUS_PATHS.length);
+		const text = await s.runAsync(args);
+		assert.match(text.out, /dev channel only/);
+		assert.match(text.out, /stable channel/);
+		assert.ok(text.out.includes(WAITLIST), text.out);
+		assert.doesNotMatch(text.out, /undefined/);
+	} finally {
+		await local.close();
+	}
 });
 
-test("a local-studio that fails or doesn't know tunnel setup is a clear refusal that says to update Local Studio", { skip: unixOnly }, async () => {
-	const s = scenario("defer-old");
-	s.script("local-studio", `echo "local-studio $*" >> ${join(s.dir, "calls.log")}\necho "unknown command: tunnel setup" >&2\nexit 2\n`);
-	const r = (await s.runAsync(["remote", "setup", "--tailnet", "--json", "--no-service"])).json();
-	assert.equal(r.code, "local_studio");
-	assert.match(r.message, /failed \(exit 2\): unknown command: tunnel setup.*update Local Studio/);
-	assert.equal(s.remoteJson(), undefined);
+test("a local-studio without tunnel setup leaves Tychicus its own route; one whose tunnel setup fails is a refusal", { skip: unixOnly }, async () => {
+	const local = await localServe(`https://${DNS}/mcp`);
+	try {
+		const old = scenario("defer-old");
+		old.script("local-studio", `echo "local-studio $*" >> ${join(old.dir, "calls.log")}\necho "unknown command: tunnel setup" >&2\nexit 2\n`);
+		const o = (await old.runAsync(["remote", "setup", "--tailnet", "--json", "--no-service", "--no-passcode", "--port", String(local.port)])).json();
+		assert.notEqual(o.code, "local_studio", o.message);
+		assert.equal(old.remoteJson()?.route, "tailnet");
+
+		const broken = scenario("defer-broken");
+		localStudioStub(broken, { answer: { state: "error", code: "tailscale", message: "Tailscale isn't running." }, exit: 1 });
+		const b = (await broken.runAsync(["remote", "setup", "--tailnet", "--json", "--no-service"])).json();
+		assert.equal(b.code, "local_studio");
+		assert.match(b.message, /failed \(exit 1\): Tailscale isn't running/);
+		assert.equal(broken.remoteJson(), undefined);
+		assert.deepEqual(mountCalls(broken), []);
+	} finally {
+		await local.close();
+	}
 });
 
 // ---------- aliases: OAuth on each host, tokens bound to the host they were issued on ----------
