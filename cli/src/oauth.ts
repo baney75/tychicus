@@ -87,6 +87,11 @@ export interface OAuthConfig {
 	redirectHosts: string[];
 	/** Every scope name a grant may hold (remote.ts SCOPES). */
 	scopes: Record<string, { what: string }>;
+	/**
+	 * Extra hostnames this serve also answers OAuth on, each as its own https origin (remote.json aliases, from Local Studio's route
+	 * record): a connector made on an old name keeps working while a new one is added on publicUrl's.
+	 */
+	aliases?: string[];
 }
 
 export class OAuthError extends Error {
@@ -121,6 +126,17 @@ export function normalizePublicUrl(raw: string): string {
 		throw new Error("--public-url is an origin only (https://host), with no path, query or credentials.");
 	}
 	return url.origin;
+}
+
+/**
+ * The config as seen from the request's Host: on an alias, publicUrl is that alias's origin, so metadata, issuer, resource and the
+ * challenge all name the address the client used, and a token issued there carries that resource, valid only on that host. Any other
+ * Host (publicUrl's own, or loopback) gets the config as it is.
+ */
+export function oauthForHost(config: OAuthConfig, host: string | undefined): OAuthConfig {
+	const name = String(host ?? "").toLowerCase().replace(/:443$/, "");
+	if (!config.aliases?.length || !name || !config.aliases.includes(name)) return config;
+	return { ...config, publicUrl: `https://${name}`, aliases: [] };
 }
 
 export const resourceUrl = (config: OAuthConfig) => `${config.publicUrl}/mcp`;
@@ -569,6 +585,8 @@ export async function approveAuthorize(config: OAuthConfig, form: URLSearchParam
 	const state = load();
 	resetLimitsOnNewPasscode(state);
 	const request = signedRequest(state, form.get("request") ?? "");
+	// An approval form names the address it was opened on; approving it on another (an alias) would hand that address's code out here.
+	if (request.resource !== resourceUrl(config)) throw new OAuthError(400, "invalid_request", "The approval form is for another address of this server. Start the connection again.");
 	const back = (params: Record<string, string>) => {
 		const url = new URL(request.redirect_uri);
 		for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);

@@ -26,6 +26,7 @@ import { loadHubConfig } from "./hub-state.ts";
 import { linkBusy, linkEnroll, linkMintCode, linkOff, linkRun, linkScopes, linkStatus, normalizeHubUrl, printCode } from "./link.ts";
 import { runTheme } from "./theme.ts";
 import { remoteFix } from "./remote-fix.ts";
+import { remoteJoin } from "./remote-join.ts";
 import { importHint, importPolycarp } from "./import-polycarp.ts";
 import { loadRemoteConfig, remoteFile, remoteOff, remoteSetup, remoteStatus, remoteTest } from "./remote-setup.ts";
 import { interactiveTerminal } from "./remote-guide.ts";
@@ -605,7 +606,7 @@ async function main(): Promise<void> {
 			let oauth: OAuthConfig | undefined;
 			if (rawPublic !== undefined || saved) {
 				try {
-					oauth = { publicUrl: normalizePublicUrl(rawPublic ?? saved?.publicUrl ?? ""), redirectHosts, scopes: offeredScopes() };
+					oauth = { publicUrl: normalizePublicUrl(rawPublic ?? saved?.publicUrl ?? ""), redirectHosts, scopes: offeredScopes(), ...(saved?.aliases?.length ? { aliases: saved.aliases } : {}) };
 				} catch (err) {
 					throw new UsageError(err instanceof Error ? err.message : String(err));
 				}
@@ -617,6 +618,7 @@ async function main(): Promise<void> {
 			const { url } = await serve({ port, host: "127.0.0.1", oauth, allowedHosts });
 			console.log(`${sym.ok} MCP over HTTP at ${url} (loopback only; every request needs a token). Ctrl-C stops it.`);
 			if (oauth) console.log(`${sym.ok} OAuth on for ${oauth.publicUrl}/mcp: add that URL as a custom connector, then approve it with your passcode or a connect code.`);
+			if (oauth?.aliases?.length) console.log(`${sym.ok} Also answering OAuth on ${oauth.aliases.map((a) => `https://${a}/mcp`).join(", ")}, each for its own connectors.`);
 			await new Promise(() => {});
 			return;
 		}
@@ -745,12 +747,13 @@ async function main(): Promise<void> {
 				const rawCloudflare = option("--cloudflare");
 				const cloudflare = flag("--cloudflare") || rawCloudflare !== undefined ? (rawCloudflare === undefined || rawCloudflare.startsWith("-") ? "" : rawCloudflare) : undefined;
 				const tailscale = flag("--tailscale");
-				if ([cloudflare !== undefined, publicUrl !== undefined, tailscale].filter(Boolean).length > 1) throw new UsageError("--tailscale, --cloudflare and --public-url are different routes: use one.");
+				const tailnet = flag("--tailnet");
+				if ([cloudflare !== undefined, publicUrl !== undefined, tailscale, tailnet].filter(Boolean).length > 1) throw new UsageError("--tailscale, --tailnet, --cloudflare and --public-url are different routes: use one.");
 				const replaceFunnel = flag("--replace-funnel");
 				if (replaceFunnel && cloudflare === undefined) throw new UsageError("--replace-funnel moves a Funnel route to Cloudflare, so it needs --cloudflare name.yourdomain.com.");
 				const json = flag("--json");
 				const noInput = flag("--no-input");
-				if (noInput && cloudflare === undefined && publicUrl === undefined && !tailscale) throw new UsageError("--no-input needs a route: --tailscale, --cloudflare name.yourdomain.com or --public-url https://host.");
+				if (noInput && cloudflare === undefined && publicUrl === undefined && !tailscale && !tailnet) throw new UsageError("--no-input needs a route: --tailscale, --tailnet, --cloudflare name.yourdomain.com or --public-url https://host.");
 				if (noInput && cloudflare === "") throw new UsageError("--no-input needs the name too: --cloudflare name.yourdomain.com.");
 				// A person at a terminal gets questions and waits; an app (--json), an agent's shell (no TTY) or --no-wait gets a report that says what's next.
 				const terminal = interactiveTerminal() && !json;
@@ -758,6 +761,7 @@ async function main(): Promise<void> {
 					publicUrl,
 					cloudflare,
 					tailscale,
+					tailnet,
 					port,
 					service: !flag("--no-service"),
 					passcode: !flag("--no-passcode"),
@@ -788,12 +792,19 @@ async function main(): Promise<void> {
 				process.exitCode = await remoteOff({ json: flag("--json") });
 				return;
 			}
+			if (sub === "join") {
+				const rawPort = option("--port");
+				const port = rawPort === undefined ? undefined : Number(rawPort);
+				if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new UsageError("--port takes a port number from 1 to 65535.");
+				process.exitCode = await remoteJoin({ json: flag("--json"), service: !flag("--no-service"), port });
+				return;
+			}
 			if (sub === "import-polycarp") {
 				process.exitCode = await importPolycarp({ dryRun: flag("--dry-run"), force: flag("--force") });
 				return;
 			}
 			throw new UsageError(
-				`Usage: ${COMMAND_NAME} remote setup [--tailscale | --cloudflare [name.yourdomain.com] | --public-url https://host] [--replace-funnel] [--port N] [--no-service] [--no-passcode] [--no-wait] [--no-input] [--yes] [--connect-code] [--json] | cloudflare login [--json] | status [--json] | test [--json] | fix [--yes] [--dry-run] [--json] | off [--json] | import-polycarp [--dry-run] [--force]`,
+				`Usage: ${COMMAND_NAME} remote setup [--tailscale | --tailnet | --cloudflare [name.yourdomain.com] | --public-url https://host] [--replace-funnel] [--port N] [--no-service] [--no-passcode] [--no-wait] [--no-input] [--yes] [--connect-code] [--json] | cloudflare login [--json] | status [--json] | test [--json] | fix [--yes] [--dry-run] [--json] | join [--no-service] [--json] | off [--json] | import-polycarp [--dry-run] [--force]`,
 			);
 		}
 		case "hub": {

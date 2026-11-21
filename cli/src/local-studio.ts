@@ -12,6 +12,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameS
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { cliLauncherPath, ensureLauncherIsSelf } from "./install.ts";
+import { localStudioDataDir } from "./route-record.ts";
 import { COMPILED, selfExec, stableReleaseProgram } from "./self.ts";
 import browserPrompt from "../../plugins/tychicus-browser/prompts/page-text.md";
 import browserToml from "../../plugins/tychicus-browser/plugin.toml";
@@ -39,8 +40,7 @@ export class LocalStudioError extends Error {}
 
 /** Local Studio's plugin folder: $LOCAL_STUDIO_DATA_DIR/plugins, else ~/.local-studio/plugins (core/src/plugins.rs). */
 export function localStudioPluginsDir(): string {
-	const data = process.env.LOCAL_STUDIO_DATA_DIR;
-	return join(data ? data : join(homedir(), ".local-studio"), "plugins");
+	return join(localStudioDataDir(), "plugins");
 }
 
 /** Eukhe's global settings file: $EUKHE_CODING_AGENT_DIR/settings.json, else ~/.eukhe/settings.json. */

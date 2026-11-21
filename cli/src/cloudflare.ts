@@ -20,6 +20,8 @@ import { dohAddresses, dohQuery } from "./doh.ts";
 import { envVar } from "./env.ts";
 import { type ToolLookup, windowsTool } from "./tool-paths.ts";
 import { cloudflareAddress, zoneFromSoa } from "./remote-state.ts";
+import { loadRemoteConfig } from "./remote-config.ts";
+import { TYCHICUS_PATH_REGEX } from "./route-record.ts";
 
 /** cloudflared's own sign-in waits on the person. Five minutes, then it counts as not done. */
 const LOGIN_TIMEOUT_MS = 300_000;
@@ -292,21 +294,82 @@ export async function prepareCloudflare(bin: string, host: string, port: number)
 			message: `Your Cloudflare sign-in is for a different domain, so Cloudflare made the DNS record ${added} instead of ${host}. Nothing else was set up. That record is the only change: delete it in the Cloudflare dashboard (DNS, Records) if you don't want it; Tychicus never deletes DNS records. Then use a name ending in .${added.startsWith(`${host}.`) ? added.slice(host.length + 1) : "the signed-in domain"}, or delete ${join(cloudflaredDir(), "cert.pem")} and sign in again choosing the domain for ${host}.`,
 		};
 	}
-	writeAtomic(
-		cloudflareConfigFile(),
-		[
-			`tunnel: ${id}`,
-			`credentials-file: ${join(cloudflaredDir(), `${id}.json`)}`,
-			"no-autoupdate: true",
-			"ingress:",
-			`  - hostname: ${host}`,
-			`    service: http://127.0.0.1:${port}`,
-			"  - service: http_status:404",
-			"",
-		].join("\n"),
-		0o600,
-	);
+	// The same tunnel set up again keeps the file's own lines (an imported tunnel keeps a credentials path that must not change).
+	const existing = readIfFile(cloudflareConfigFile());
+	const sameTunnel = existing !== undefined && topLevelValue(existing, "tunnel") === id;
+	const head = sameTunnel ? existing : [`tunnel: ${id}`, `credentials-file: ${join(cloudflaredDir(), `${id}.json`)}`, "no-autoupdate: true", ""].join("\n");
+	const rendered = renderCloudflareConfig(head, host, port);
+	if (!rendered.ok) return { ok: false, code: "cloudflare_tunnel", nameStep: false, message: rendered.message };
+	writeAtomic(cloudflareConfigFile(), rendered.text, 0o600);
 	return { ok: true, tunnel: name };
+}
+
+const readIfFile = (path: string): string | undefined => {
+	try {
+		return readFileSync(path, "utf8");
+	} catch {
+		return undefined;
+	}
+};
+
+/** The value of a top-level `key: value` line, unquoted, or undefined. */
+export function topLevelValue(text: string, key: string): string | undefined {
+	const m = new RegExp(`^${key}:[ \t]*(.+?)[ \t]*$`, "m").exec(text);
+	return m ? m[1].replace(/^(["'])(.*)\1$/, "$2") : undefined;
+}
+
+/**
+ * The ingress for Tychicus's own Cloudflare route, on a machine without Local Studio (docs/decisions.md, D57): exactly Tychicus's
+ * nine paths to serve, then 404 for everything else, the root included. Local Studio's route carries these same paths.
+ */
+export function cloudflareIngress(host: string, port: number): string[] {
+	return ["ingress:", `  - hostname: ${host}`, `    path: ${TYCHICUS_PATH_REGEX}`, `    service: http://127.0.0.1:${port}`, "  - service: http_status:404"];
+}
+
+/**
+ * cloudflared.yml with its ingress rendered for `host` and `port`. Every other line of `existing` stays as it is: the tunnel id, the
+ * credentials file, a log file, an origin certificate. Only the `ingress:` block is replaced. A file without its tunnel and
+ * credentials-file lines can't be rendered: nothing would say which tunnel to run.
+ */
+export function renderCloudflareConfig(existing: string, host: string, port: number): { ok: true; text: string } | { ok: false; message: string } {
+	if (topLevelValue(existing, "tunnel") === undefined || topLevelValue(existing, "credentials-file") === undefined) {
+		return { ok: false, message: `${cloudflareConfigFile()} has no tunnel: or credentials-file: line, so the tunnel can't be rendered. Run ${COMMAND_NAME} remote setup --cloudflare ${host} again.` };
+	}
+	const kept: string[] = [];
+	let inIngress = false;
+	for (const line of existing.replace(/\r\n/g, "\n").split("\n")) {
+		if (/^ingress:/.test(line)) {
+			inIngress = true;
+			continue;
+		}
+		// The ingress block runs until the next line that starts a top-level key; its list items and their fields are indented or start with "-".
+		if (inIngress && (line === "" || /^[\s-]/.test(line) || /^#/.test(line))) continue;
+		inIngress = false;
+		kept.push(line);
+	}
+	while (kept.length && kept[kept.length - 1] === "") kept.pop();
+	if (!kept.some((line) => /^no-autoupdate:/.test(line))) kept.push("no-autoupdate: true");
+	return { ok: true, text: `${[...kept, ...cloudflareIngress(host, port)].join("\n")}\n` };
+}
+
+/**
+ * Before a start, cloudflared.yml's ingress is rendered again from remote.json, so a file from an older Tychicus (one rule for the
+ * whole hostname) gets the exact paths. The file runs as it is when remote.json is missing or not on the Cloudflare route.
+ */
+export function rerenderBeforeStart(): { ok: true } | { ok: false; message: string } {
+	const existing = readIfFile(cloudflareConfigFile());
+	if (existing === undefined) return { ok: false, message: `${cloudflareConfigFile()} is missing. Run ${COMMAND_NAME} remote setup --cloudflare <name> again.` };
+	let config: ReturnType<typeof loadRemoteConfig>;
+	try {
+		config = loadRemoteConfig();
+	} catch (err) {
+		return { ok: false, message: err instanceof Error ? err.message : String(err) };
+	}
+	if (!config || config.route !== "cloudflare") return { ok: true };
+	const next = renderCloudflareConfig(existing, new URL(config.publicUrl).hostname, config.port);
+	if (!next.ok) return next;
+	if (next.text !== existing) writeAtomic(cloudflareConfigFile(), next.text, 0o600);
+	return { ok: true };
 }
 
 /** What the service runs: cloudflared in the foreground, so the service manager sees it stop. */
@@ -316,8 +379,10 @@ export function runCloudflareTunnel(): Promise<number> {
 		console.error("cloudflared isn't installed.");
 		return Promise.resolve(1);
 	}
-	if (!existsSync(cloudflareConfigFile())) {
-		console.error(`${cloudflareConfigFile()} is missing. Run ${COMMAND_NAME} remote setup --cloudflare <name> again.`);
+	// The ingress comes from remote.json every start, so the exact paths hold even for a file an older version wrote.
+	const rendered = rerenderBeforeStart();
+	if (!rendered.ok) {
+		console.error(rendered.message);
 		return Promise.resolve(1);
 	}
 	const child = spawn(bin, ["tunnel", "--config", cloudflareConfigFile(), "run"], { stdio: "inherit" });

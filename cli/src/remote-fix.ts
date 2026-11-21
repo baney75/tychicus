@@ -17,7 +17,7 @@ import { type ProofCheck, publicChecks } from "./remote-test.ts";
 import { releaseRoot } from "./paths.ts";
 import { COMMAND_NAME } from "./self.ts";
 import { currentRelease, staleServices } from "./service-version.ts";
-import { installService, SERVE_SERVICE, type ServiceSpec, serviceFile, serviceLogHint, serviceRunning, sleep } from "./service.ts";
+import { installService, SERVE_SERVICE, type ServiceSpec, serviceFile, serviceLogHint, serviceOfOtherConfig, serviceRunning, sleep } from "./service.ts";
 import { c, sym } from "./ui.ts";
 
 /** The repairs, in the order they run: a rename first (serve must restart for the new name), serve before Funnel (setup's rule). */
@@ -195,6 +195,12 @@ export async function remoteFix(options: FixOptions): Promise<number> {
 		if (options.json) printReport({ ok: false, state: "problem", code: "not_set_up", message, next: { kind: "run_command", command }, actions: [], advice: [] });
 		else console.error(`${sym.fail} ${message}`);
 		return EXIT_NEEDS_PERSON;
+	}
+	const foreign = serviceOfOtherConfig([SERVE_SERVICE, CLOUDFLARE_SERVICE]);
+	if (foreign) {
+		if (options.json) printReport({ ok: false, state: "problem", code: foreign.code, message: foreign.message, actions: [], advice: [] });
+		else console.error(`${sym.fail} ${foreign.message}`);
+		return EXIT_FAILED;
 	}
 
 	const done: FixAction[] = [];

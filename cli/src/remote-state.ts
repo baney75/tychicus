@@ -14,6 +14,8 @@
  * - ready: nothing is set up yet and nothing stands in the way.
  * - on: set up, answering here and reachable from the internet.
  * - no_browser_connected: set up and reachable, but no browser has the extension loaded, so an assistant would find nothing to drive.
+ * - waitlist: Local Studio runs this machine's tunnel, and its build offers the tunnel by waitlist only (stable and nightly);
+ *   `message` is Local Studio's own, passed through unchanged.
  * - problem: anything else; `message` says what and `checks` (status only) says which.
  */
 export type RemoteState =
@@ -27,6 +29,7 @@ export type RemoteState =
 	| "ready"
 	| "on"
 	| "no_browser_connected"
+	| "waitlist"
 	| "problem";
 
 export const REMOTE_STATES: readonly RemoteState[] = [
@@ -40,8 +43,28 @@ export const REMOTE_STATES: readonly RemoteState[] = [
 	"ready",
 	"on",
 	"no_browser_connected",
+	"waitlist",
 	"problem",
 ];
+
+/**
+ * What an agent setting a tunnel up for a person does next, on every `remote setup --json` and `remote join --json` report:
+ * ready (on, its own route), joined (on, through Local Studio's tunnel), needs_signin (the person signs in: Tailscale or
+ * Cloudflare), needs_dns (a name isn't published or can't be used yet), waitlist (Local Studio's tunnel is waitlist only on this
+ * build), error (anything else; `code` says what and `next` what to run or open).
+ */
+export type AgentStep = "ready" | "joined" | "needs_signin" | "needs_dns" | "waitlist" | "error";
+
+const SIGN_IN_CODES = new Set(["cloudflare_login"]);
+const DNS_CODES = new Set(["dns", "dns_lookup", "cloudflare_dns", "cloudflare_zone", "cloudflare_name"]);
+
+export function agentStep(report: { ok: boolean; state: RemoteState; code?: string; next?: RemoteNext }, joined = false): AgentStep {
+	if (report.state === "waitlist") return "waitlist";
+	if (report.ok) return joined ? "joined" : "ready";
+	if (report.state === "tailscale_signed_out" || report.next?.kind === "sign_in" || (report.code !== undefined && SIGN_IN_CODES.has(report.code))) return "needs_signin";
+	if (report.code !== undefined && DNS_CODES.has(report.code)) return "needs_dns";
+	return "error";
+}
 
 /** Which ways of reaching this computer are installed and signed in, for an app that offers the choice. */
 export interface RemoteRoutes {
@@ -77,6 +100,10 @@ export function setupExitCode(report: { ok: boolean; next?: RemoteNext }): numbe
 export interface SetupReport {
 	ok: boolean;
 	state: RemoteState;
+	/** For an agent: what happens next (agentStep). The app reads `state`; this is the same report, said as one step. */
+	step?: AgentStep;
+	/** On waitlist: Local Studio's own report from `local-studio tunnel setup --json`, unchanged. */
+	localStudio?: Record<string, unknown>;
 	message: string;
 	adminUrl?: string;
 	/**
